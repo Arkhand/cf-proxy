@@ -261,9 +261,19 @@ async function main() {
 		fail(found.error, "Revisar que el space tenga una instancia del servicio `destination`, o correr npm run deploy.");
 	}
 
-	const destClient = makeDestinationClient(found.destination.creds);
+	// Contexto MUTABLE: todo lo que depende del subaccount. El proxy lo lee en
+	// cada request, asi que cambiar de org/space (retarget) es reemplazar estos
+	// campos, sin reiniciar el proceso ni cortar el puerto.
+	const ctx = {
+		destClient: makeDestinationClient(found.destination.creds),
+		connectivity: null,          // lo completa el PASO 5
+		connTokenProvider: null,
+		connectivityNote: "",
+		cfTarget: { org: session.org, space: session.space, user: session.user }
+	};
+
 	const connCreds = found.connectivity ? found.connectivity.creds : null;
-	const connTokenProvider = connCreds ? makeTokenProvider(connCreds) : null;
+	ctx.connTokenProvider = connCreds ? makeTokenProvider(connCreds) : null;
 
 	// ========================================================================
 	// PASO 4 - Login de usuario (solo importa para PrincipalPropagation)
@@ -288,7 +298,7 @@ async function main() {
 	// ========================================================================
 	if (LIST_ONLY) {
 		log("\n  Destinations del subaccount:\n");
-		const all = await destClient.list();
+		const all = await ctx.destClient.list();
 
 		// Se agrupan por tipo de auth para que se vea de un vistazo cuales
 		// van a funcionar desde la PC y cuales no.
@@ -317,18 +327,56 @@ async function main() {
 	// PASO 5 - Acceso al Connectivity Proxy (solo importa para on-premise)
 	// ========================================================================
 	log("\n[5/6] Verificando acceso al Connectivity Proxy...");
-	const { connectivity, note: connectivityNote } = await resolveConnectivity(connCreds);
+	const paso5 = await resolveConnectivity(connCreds);
+	ctx.connectivity = paso5.connectivity;
+	ctx.connectivityNote = paso5.note;
+
+	/**
+	 * Cambiar de org/space sin reiniciar.
+	 *
+	 * Reapunta el CLI y rehace los pasos 2, 3 y 5: las credenciales del
+	 * subaccount anterior no sirven en el nuevo. Si algo falla, se restaura el
+	 * target anterior y el contexto queda intacto.
+	 *
+	 * El tunel SSH se cierra siempre: cuelga de una app del space viejo.
+	 */
+	async function retarget(org, space) {
+		const previous = { ...ctx.cfTarget };
+		log(`\n  Cambiando target a ${org} / ${space}...`);
+
+		const applied = await cf.setTarget(org, space);
+		if (!applied.ok) {
+			return applied;
+		}
+
+		closeTunnel();
+
+		const next = await discover({ allowCreate: ALLOW_CREATE, preferredXsuaa: XSUAA_INSTANCE, log });
+		if (!next.ok) {
+			// Volver atras: dejar el CLI donde estaba es mas util que dejarlo a medias.
+			await cf.setTarget(previous.org, previous.space);
+			return { ok: false, error: `${org}/${space}: ${next.error.split("\n")[0]}` };
+		}
+
+		const nextConn = next.connectivity ? next.connectivity.creds : null;
+		const conn = await resolveConnectivity(nextConn);
+
+		ctx.destClient = makeDestinationClient(next.destination.creds);
+		ctx.connTokenProvider = nextConn ? makeTokenProvider(nextConn) : null;
+		ctx.connectivity = conn.connectivity;
+		ctx.connectivityNote = conn.note;
+		ctx.cfTarget = { org, space, user: previous.user };
+
+		log(`  OK  target: ${org} / ${space}\n`);
+		return { ok: true };
+	}
 
 	// ========================================================================
 	// PASO 6 - Levantar el proxy
 	// ========================================================================
 	log("\n[6/6] Levantando proxy local...");
 
-	const server = createProxyServer({
-		destClient, connectivity, connTokenProvider, connectivityNote, auth, log,
-		// Se muestra en la pagina antes de crear/editar: es el subaccount que se toca.
-		cfTarget: { org: session.org, space: session.space, user: session.user }
-	});
+	const server = createProxyServer({ ctx, auth, onRetarget: retarget, log });
 
 	server.listen(PORT, () => {
 		console.log(`\n  Escuchando en http://localhost:${PORT}`);
@@ -337,9 +385,11 @@ async function main() {
 		console.log(`  Listado:  http://localhost:${PORT}/__destinations`);
 		console.log(`  Detalle:  http://localhost:${PORT}/__destination/<NOMBRE>`);
 		console.log(`  Estado:   http://localhost:${PORT}/__health`);
+		console.log(`  Probar:   http://localhost:${PORT}/__test/<NOMBRE>`);
 		console.log(`  Editar:   desde la pagina (botones Nueva destination / Editar; piden confirmacion)`);
 		console.log(`  Login:    ${auth.configured ? `http://localhost:${PORT}/__login` : "no disponible (npm run deploy)"}`);
-		console.log(`  On-prem:  ${connectivity ? "si" : "no (ver /__health)"}\n`);
+		console.log(`  Target:   ${ctx.cfTarget.org} / ${ctx.cfTarget.space}  (se cambia desde la pagina)`);
+		console.log(`  On-prem:  ${ctx.connectivity ? "si" : "no (ver /__health)"}\n`);
 
 		if (LOGIN && auth.configured) {
 			openBrowser(`http://localhost:${PORT}/__login`);

@@ -65,6 +65,83 @@ async function checkLogin() {
 }
 
 /**
+ * PASO 2b - Listar los orgs y spaces a los que el usuario tiene acceso.
+ *
+ * Se usa para el selector de la pagina: cambiar de subaccount sin reiniciar
+ * el proxy ni salir a la terminal. Una sola pasada por la API v3, cruzando
+ * spaces con sus orgs por guid.
+ */
+async function listTargets() {
+	const orgs = await curlAll("/v3/organizations?per_page=100");
+	if (!orgs.length) {
+		return [];
+	}
+
+	const orgName = {};
+	for (const o of orgs) {
+		orgName[o.guid] = o.name;
+	}
+
+	const spaces = await curlAll("/v3/spaces?per_page=100");
+	const byOrg = {};
+	for (const s of spaces) {
+		const guid = s.relationships?.organization?.data?.guid;
+		if (!orgName[guid]) continue;
+		(byOrg[guid] = byOrg[guid] || []).push(s.name);
+	}
+
+	return orgs
+		.map((o) => ({ org: o.name, spaces: (byOrg[o.guid] || []).sort((a, b) => a.localeCompare(b)) }))
+		.filter((o) => o.spaces.length)
+		.sort((a, b) => a.org.localeCompare(b.org));
+}
+
+/**
+ * PASO 2b - Cambiar el target de CF.
+ *
+ * Afecta al CLI entero, no solo a este proceso: es el mismo `cf target -o -s`
+ * que se correria a mano. Por eso quien lo llama tiene que rehacer el
+ * descubrimiento de servicios; las credenciales del subaccount anterior ya
+ * no sirven.
+ */
+async function setTarget(org, space) {
+	const res = await cf(["target", "-o", org, "-s", space], 60000);
+	if (!res.ok) {
+		// `cf` manda el detalle por stdout o stderr segun la version.
+		const why = (res.err || res.out || "").trim().split("\n").filter(Boolean).slice(-2).join(" ");
+		return { ok: false, error: why || `No se pudo apuntar a ${org}/${space}.` };
+	}
+	return { ok: true };
+}
+
+/** GET paginado de la API v3 de CF: devuelve todos los `resources`. */
+async function curlAll(firstUrl) {
+	const out = [];
+	let url = firstUrl;
+
+	while (url) {
+		const res = await cf(["curl", url], 60000);
+		if (!res.out.includes("{")) break;
+
+		let body;
+		try {
+			body = JSON.parse(res.out.slice(res.out.indexOf("{")));
+		} catch (e) {
+			break;
+		}
+
+		for (const r of body.resources || []) {
+			out.push(r);
+		}
+
+		const next = body.pagination?.next?.href;
+		url = next ? new URL(next).pathname + new URL(next).search : null;
+	}
+
+	return out;
+}
+
+/**
  * PASO 2a - Listar las instancias de servicio del space actual.
  *
  * Se usa la API v3 via `cf curl` en vez de parsear la tabla de `cf services`,
@@ -243,6 +320,8 @@ function startTunnel({ appName, localPort, remoteHost, remotePort }) {
 
 module.exports = {
 	checkLogin,
+	listTargets,
+	setTarget,
 	listServiceInstances,
 	listServiceKeys,
 	readServiceKey,

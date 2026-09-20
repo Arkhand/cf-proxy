@@ -118,7 +118,9 @@ sin build) con:
   forma que devuelve `getDestination()` de `@sap-cloud-sdk/connectivity`.
   Los secretos van ocultos; el check **Mostrar secretos** los revela;
 - la fila **Target CF** (org / space / usuario): es el subaccount que se toca
-  al crear, editar o eliminar;
+  al crear, editar o eliminar, con botón **Cambiar** para saltar a otro
+  org/space sin reiniciar (ver abajo);
+- botón **Probar** por destination: un GET real por el camino del proxy;
 - **Nueva destination**, y **Editar** / **Eliminar** por fila. Ver abajo.
 
 ### Crear, editar y eliminar destinations
@@ -171,6 +173,33 @@ Detalles de comportamiento:
   escribe. Además el body debe ser `application/json`, lo que fuerza preflight
   CORS y bloquea escrituras desde páginas de otro origen.
 
+### Cambiar de org/space sin reiniciar
+
+El botón **Cambiar** al lado de *Target CF* lista los orgs y spaces a los que
+tenés acceso y reapunta el CLI (`cf target -o -s`) sin cortar el proxy: se
+rehace el descubrimiento de servicios, se reabre el túnel y la tabla pasa a
+mostrar las destinations del nuevo subaccount. No modifica nada en BTP.
+
+Si el nuevo space no tiene una instancia de `destination` usable, el cambio se
+revierte y el target vuelve a donde estaba: nunca queda a medias.
+
+### Probar una destination
+
+El botón **Probar** hace un `GET` por el mismo camino que usaría el proxy
+—autenticación, túnel, Connectivity Proxy— y dice **en qué etapa se corta**:
+
+| Etapa | Qué significa |
+|---|---|
+| `resolve` | La destination no existe, o el Destination Service no la resuelve |
+| `auth` | El tipo de autenticación falló (token no emitido, falta login…) |
+| `route` | Es OnPremise y no hay Connectivity Proxy alcanzable |
+| `connect` | No se llegó al backend (DNS, timeout, puerto cerrado) |
+| `response` | El backend contestó: se muestra el status y los headers que explican un 401 |
+
+Es solo lectura: no escribe en BTP ni en el backend. Ante un `401` con
+`WWW-Authenticate`, la página explica el caso típico de PrincipalPropagation
+(el Cloud Connector no envió el certificado del usuario).
+
 ### Endpoints propios
 
 - `GET /` — la página de diagnóstico.
@@ -180,6 +209,9 @@ Detalles de comportamiento:
 - `GET /__health` — estado del proxy, target de CF, acceso on-premise y sesión de usuario.
 - `GET /__login` — redirige al login de XSUAA. `GET /__logout` borra la sesión.
 - `GET /__callback` — a donde vuelve XSUAA. No se llama a mano.
+- `GET /__targets` — orgs y spaces accesibles, y el target actual.
+- `POST /__target` — `{ org, space }`. Reapunta el CLI y rehace el descubrimiento.
+- `GET /__test/<nombre>?path=/x` — prueba la destination (solo lectura).
 
 Edición (todos con body `application/json`; las escrituras exigen
 `confirm` igual al nombre exacto):
@@ -353,3 +385,5 @@ una con `--tunnel-app`. El túnel se cierra al cortar el proxy con Ctrl+C.
 | `404 La destination X no existe` | Nombre mal escrito | `GET /__destinations` |
 | `400 CONFIRMACION REQUERIDA para ...` | Escritura sin `confirm` | Mandar `confirm` con el nombre exacto (la página lo hace al tipearlo) |
 | `400 El body tiene que ser JSON` | Falta `content-type: application/json` | Agregar el header |
+| Probar corta en `connect` | DNS/red o el backend no responde | Si es OnPremise, revisar el túnel en `/__health` |
+| Probar corta en `auth` | El servicio no emitió token | El error trae el motivo real del token service |

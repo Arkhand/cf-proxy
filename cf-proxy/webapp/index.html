@@ -23,6 +23,9 @@
 		  POST /__destinations              crear   (exige confirm = nombre)
 		  PUT  /__destinations/<nombre>     actualizar (exige confirm = nombre)
 		  DELETE /__destinations/<nombre>   eliminar (exige confirm = nombre; devuelve backup)
+		  GET  /__targets                   orgs y spaces accesibles
+		  POST /__target                    { org, space } cambia el target de CF
+		  GET  /__test/<nombre>?path=/x     prueba la destination (solo lectura)
 	-->
 	<script id="sap-ui-bootstrap"
 		src="https://ui5.sap.com/resources/sap-ui-core.js"
@@ -128,6 +131,7 @@ sap.ui.getCore().attachInit(function () {
 					model.setProperty("/canLogout", Boolean(h.login && h.login.loggedIn));
 					// Org/space que se va a tocar al crear/editar: se muestra en todos los dialogos.
 					model.setProperty("/target", h.target ? h.target.org + " / " + h.target.space + "  (" + h.target.user + ")" : "desconocido");
+					model.setProperty("/canRetarget", Boolean(h.canRetarget));
 					return h.ok ? h : null;
 				});
 		}
@@ -732,6 +736,161 @@ sap.ui.getCore().attachInit(function () {
 		}
 
 		// ---------------------------------------------------------------
+		// Selector de org/space: cambiar de subaccount sin reiniciar.
+		//
+		// Cambiar de target reemplaza credenciales, tunel y cache del lado del
+		// proxy; por eso se pide confirmacion y despues se recarga todo. No
+		// cambia nada en BTP: es el mismo `cf target -o -s`.
+		// ---------------------------------------------------------------
+		function openTargetSelector() {
+			var error = new MessageStrip({ type: "Error", showIcon: true, visible: false });
+			var orgBox = new ComboBox({ width: "24rem", placeholder: "cargando…" });
+			var spaceBox = new ComboBox({ width: "24rem", enabled: false });
+			var byOrg = {};
+
+			function fillSpaces() {
+				var org = (orgBox.getValue() || "").trim();
+				spaceBox.destroyItems();
+				(byOrg[org] || []).forEach(function (sp) { spaceBox.addItem(new Item({ key: sp, text: sp })); });
+				spaceBox.setEnabled(Boolean(byOrg[org]));
+				spaceBox.setValue((byOrg[org] || []).length === 1 ? byOrg[org][0] : "");
+			}
+			orgBox.attachChange(fillSpaces);
+			orgBox.attachSelectionChange(fillSpaces);
+
+			BusyIndicator.show(0);
+			fetch(base + "/__targets").then(function (r) { return r.json(); })
+				.then(function (body) {
+					if (body.error) { throw new Error(body.error); }
+					(body.targets || []).forEach(function (t) {
+						byOrg[t.org] = t.spaces;
+						orgBox.addItem(new Item({ key: t.org, text: t.org }));
+					});
+					orgBox.setPlaceholder("Elegí un org");
+					if (body.current) { orgBox.setValue(body.current.org); fillSpaces(); spaceBox.setValue(body.current.space); }
+				})
+				.catch(function (e) { error.setText(e.message).setVisible(true); })
+				.finally(function () { BusyIndicator.hide(); });
+
+			var goBtn = new Button({ text: "Cambiar target", type: "Emphasized", press: function () {
+				var org = (orgBox.getValue() || "").trim();
+				var space = (spaceBox.getValue() || "").trim();
+				if (!org || !space) { error.setText("Elegí org y space.").setVisible(true); return; }
+				goBtn.setEnabled(false);
+				BusyIndicator.show(0);
+				postJson("POST", base + "/__target", { org: org, space: space })
+					.then(function (body) {
+						MessageToast.show("Target: " + body.target.org + " / " + body.target.space);
+						dlg.close();
+						reload();
+					})
+					.catch(function (e) { error.setText(e.message).setVisible(true); goBtn.setEnabled(true); })
+					.finally(function () { BusyIndicator.hide(); });
+			} });
+
+			var dlg = new Dialog({
+				title: "Cambiar org / space",
+				contentWidth: "34rem",
+				content: [ new VBox({ items: [
+					new MessageStrip({ type: "Information", showIcon: true, text:
+						"Cambia el target del CLI de `cf` (como `cf target -o -s`) y vuelve a descubrir los servicios. " +
+						"No modifica nada en BTP. Las destinations que veas después son las del nuevo subaccount."
+					}).addStyleClass("sapUiSmallMarginBottom"),
+					formRow("Org", orgBox, true),
+					formRow("Space", spaceBox, true),
+					error.addStyleClass("sapUiSmallMarginTop")
+				] }).addStyleClass("sapUiSmallMargin") ],
+				beginButton: goBtn,
+				endButton: new Button({ text: "Cancelar", press: function () { dlg.close(); } }),
+				afterClose: function () { dlg.destroy(); }
+			});
+			dlg.open();
+		}
+
+		// ---------------------------------------------------------------
+		// Probar una destination: un GET real por el mismo camino que usaria
+		// el proxy. Solo lectura; dice en que etapa se corta.
+		// ---------------------------------------------------------------
+		var TEST_STAGE = {
+			resolve: "Resolver la destination (definición o Destination Service)",
+			auth: "Aplicar la autenticación",
+			route: "Elegir la ruta (Connectivity Proxy / túnel)",
+			connect: "Conectar con el backend",
+			response: "El backend respondió"
+		};
+
+		function openTest(name) {
+			var pathIn = new Input({ width: "24rem", value: "/", placeholder: "/ruta/a/probar" });
+			var result = new VBox();
+			var error = new MessageStrip({ type: "Error", showIcon: true, visible: false });
+
+			function run() {
+				error.setVisible(false);
+				result.destroyItems();
+				runBtn.setEnabled(false);
+				BusyIndicator.show(0);
+				fetch(base + "/__test/" + encodeURIComponent(name) + "?path=" + encodeURIComponent(pathIn.getValue() || "/"))
+					.then(function (r) { return r.json(); })
+					.then(function (r) {
+						if (r.error && !r.stage) { throw new Error(r.error); }
+						// Un 2xx/3xx es exito; un 4xx/5xx llego al backend pero fallo alla.
+						var reached = r.stage === "response";
+						var okHttp = reached && r.status < 400;
+						result.addItem(new MessageStrip({
+							type: okHttp ? "Success" : reached ? "Warning" : "Error",
+							showIcon: true,
+							text: (reached ? "HTTP " + r.status + " " + (r.statusText || "") : "No llegó al backend") +
+								" — " + (TEST_STAGE[r.stage] || r.stage) + " (" + r.ms + " ms)"
+						}).addStyleClass("sapUiSmallMarginBottom"));
+
+						var rows = {};
+						if (r.error) { rows["Error"] = r.error; }
+						if (r.url) { rows["URL"] = r.url; }
+						if (r.via) { rows["Vía"] = r.via; }
+						if (r.authentication) { rows["Autenticación"] = r.authentication; }
+						if (r.hints) {
+							Object.keys(r.hints).forEach(function (k) { if (r.hints[k]) { rows[k] = r.hints[k]; } });
+						}
+						result.addItem(propertyTable(rows));
+
+						// El 401 con WWW-Authenticate es el sintoma clasico de
+						// PrincipalPropagation sin certificado: se explica en vez de
+						// dejar al usuario adivinando.
+						if (reached && r.status === 401 && r.hints && r.hints["www-authenticate"]) {
+							result.addItem(new MessageStrip({ type: "Information", showIcon: true, text:
+								"El backend pide autenticación (" + r.hints["www-authenticate"] + "). " +
+								"Con PrincipalPropagation suele significar que el Cloud Connector no envió el certificado del usuario: " +
+								"revisar Principal Type del recurso y el Subject Pattern."
+							}).addStyleClass("sapUiSmallMarginTop"));
+						}
+					})
+					.catch(function (e) { error.setText(e.message).setVisible(true); })
+					.finally(function () { runBtn.setEnabled(true); BusyIndicator.hide(); });
+			}
+
+			var runBtn = new Button({ text: "Probar", icon: "sap-icon://play", type: "Emphasized", press: run });
+
+			var dlg = new Dialog({
+				title: "Probar " + name,
+				contentWidth: "44rem",
+				content: [ new VBox({ items: [
+					new MessageStrip({ type: "Information", showIcon: true, text:
+						"Hace un GET por el mismo camino que usaría el proxy (autenticación, túnel, Connectivity Proxy). " +
+						"Solo lectura: no escribe nada ni en BTP ni en el backend."
+					}).addStyleClass("sapUiSmallMarginBottom"),
+					formRow("Path", pathIn, false),
+					result.addStyleClass("sapUiSmallMarginTop"),
+					error.addStyleClass("sapUiSmallMarginTop")
+				] }).addStyleClass("sapUiSmallMargin") ],
+				beginButton: runBtn,
+				endButton: new Button({ text: "Cerrar", press: function () { dlg.close(); } }),
+				afterClose: function () { dlg.destroy(); }
+			});
+			dlg.open();
+			run();
+		}
+
+		// ---------------------------------------------------------------
 		// Cabecera: los tres URLs y el boton de estado
 		// ---------------------------------------------------------------
 		var healthStrip = new MessageStrip({
@@ -758,11 +917,14 @@ sap.ui.getCore().attachInit(function () {
 					urlRow("Uso:", base + "/<NOMBRE_DESTINATION>/<path>", false),
 					urlRow("Listado:", base + "/__destinations", true),
 					urlRow("Detalle:", base + "/__destination/<NOMBRE>", false),
+					urlRow("Probar:", base + "/__test/<NOMBRE>", false),
 					urlRow("Estado:", base + "/__health", true),
 					urlRow("Login:", base + "/__login", true),
 					new HBox({ alignItems: "Center", items: [
 						new Label({ text: "Target CF:", width: "6rem" }),
-						new ObjectStatus({ text: "{/target}", state: "Information", inverted: true })
+						new ObjectStatus({ text: "{/target}", state: "Information", inverted: true }),
+						new Button({ text: "Cambiar", icon: "sap-icon://switch-views", type: "Transparent",
+							visible: "{/canRetarget}", press: openTargetSelector }).addStyleClass("sapUiTinyMarginBegin")
 					] }).addStyleClass("sapUiTinyMarginTop"),
 					new HBox({ items: [
 						new Button({ text: "Chequear estado", icon: "sap-icon://refresh", type: "Emphasized", press: reload }),
@@ -803,7 +965,7 @@ sap.ui.getCore().attachInit(function () {
 				new Column({ header: new Text({ text: "Proxy" }), width: "7rem", minScreenWidth: "Tablet", demandPopin: true }),
 				new Column({ header: new Text({ text: "URL backend" }), minScreenWidth: "Desktop", demandPopin: true }),
 				new Column({ header: new Text({ text: "Estado" }), width: "14rem" }),
-				new Column({ width: "20rem", hAlign: "End" })
+				new Column({ width: "26rem", hAlign: "End" })
 			],
 			items: {
 				path: "/destinations",
@@ -814,6 +976,9 @@ sap.ui.getCore().attachInit(function () {
 					new Text({ text: "{url}", maxLines: 1 }),
 					new ObjectStatus({ text: "{stateText}", state: "{state}" }),
 					new HBox({ justifyContent: "End", items: [
+						new Button({ text: "Probar", icon: "sap-icon://play", press: function (e) {
+							openTest(e.getSource().getBindingContext().getProperty("name"));
+						} }).addStyleClass("sapUiTinyMarginEnd"),
 						new Button({ text: "Detalles", icon: "sap-icon://detail-view", press: function (e) {
 							showDetail(e.getSource().getBindingContext().getProperty("name"));
 						} }),

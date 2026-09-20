@@ -4,7 +4,8 @@
  * Levanta el servidor real con un `destClient` STUB que solo anota con que
  * lo llamaron. No hay red hacia BTP ni service keys: verifica el ruteo, la
  * exigencia de content-type, que `confirm` y `replace` lleguen enteros a la
- * capa de abajo, y que los secretos no salgan hacia el browser.
+ * capa de abajo, que los secretos no salgan hacia el browser, y que el
+ * contexto mutable (cambio de org/space) se refleje en el acto.
  *
  * Uso:  node test/proxy-write.test.js
  */
@@ -15,7 +16,12 @@ const { createProxyServer } = require("../lib/proxy");
 const calls = [];
 const stub = {
 	list: async () => [{ name: "A", url: "https://a", auth: "NoAuthentication", proxyType: "Internet" }],
-	resolve: async () => { throw new Error("no se usa en este test"); },
+	resolve: async (name) => {
+		calls.push({ fn: "resolve", name });
+		if (name !== "EXISTE") { throw new Error(`La destination \`${name}\` no existe en este subaccount.`); }
+		// Host inexistente a proposito: el test verifica el diagnostico, no la red.
+		return { config: { Name: name, URL: "https://no-existe.invalid", Authentication: "NoAuthentication", ProxyType: "Internet" }, authTokens: [] };
+	},
 	raw: async (name) => {
 		calls.push({ fn: "raw", name });
 		return name === "EXISTE"
@@ -52,10 +58,25 @@ const stub = {
 
 const auth = { configured: false, reason: "sin xsuaa", status: () => ({ configured: false }), getUserToken: async () => null };
 
-const server = createProxyServer({
+// Contexto mutable: lo mismo que arma server.js. `retarget` imita el cambio
+// de org/space reemplazando el cliente, para verificar que el server lo lee
+// en cada request y no lo capturo al crearse.
+const ctx = {
 	destClient: stub, connectivity: null, connTokenProvider: null, connectivityNote: "",
-	auth, cfTarget: { org: "ORG-TEST", space: "SPACE-TEST", user: "yo" }, log: () => {}
-});
+	cfTarget: { org: "ORG-TEST", space: "SPACE-TEST", user: "yo" }
+};
+
+const otherStub = { ...stub, list: async () => [{ name: "OTRA-SUBACCOUNT", url: "https://b", auth: "NoAuthentication", proxyType: "Internet" }] };
+
+async function retarget(org, space) {
+	calls.push({ fn: "retarget", org, space });
+	if (org === "NO-EXISTE") { return { ok: false, error: `No se pudo apuntar a ${org}/${space}.` }; }
+	ctx.destClient = otherStub;
+	ctx.cfTarget = { org, space, user: "yo" };
+	return { ok: true };
+}
+
+const server = createProxyServer({ ctx, auth, onRetarget: retarget, log: () => {} });
 
 /** Request minimo contra el server de test; devuelve { status, json }. */
 function call(port, method, path, body, contentType = "application/json") {
@@ -85,6 +106,7 @@ server.listen(0, async () => {
 	// --- /__health trae el target ------------------------------------------
 	r = await call(port, "GET", "/__health");
 	ok("/__health incluye target org/space", r.json.target && r.json.target.org === "ORG-TEST" && r.json.target.space === "SPACE-TEST");
+	ok("/__health avisa que se puede cambiar de target", r.json.canRetarget === true);
 
 	// --- El listado GET sigue funcionando (sin regresion) --------------------
 	r = await call(port, "GET", "/__destinations");
@@ -156,6 +178,43 @@ server.listen(0, async () => {
 		req.end("{esto no es json");
 	});
 	ok("JSON invalido da 400 con mensaje claro", r.status === 400 && /JSON invalido/.test(r.json.error));
+
+	// --- cambio de org/space: el contexto es mutable y se lee por request ----
+	calls.length = 0;
+	r = await call(port, "POST", "/__target", { org: "OTRO-ORG" });
+	ok("POST /__target sin space da 400", r.status === 400 && /space/.test(r.json.error));
+	ok("POST /__target incompleto no reapunta", !calls.some((c) => c.fn === "retarget"));
+
+	r = await call(port, "POST", "/__target", { org: "NO-EXISTE", space: "X" });
+	ok("POST /__target que falla devuelve 400 con el motivo", r.status === 400 && /No se pudo apuntar/.test(r.json.error));
+	r = await call(port, "GET", "/__health");
+	ok("un retarget fallido NO cambia el target visible", r.json.target.org === "ORG-TEST");
+
+	r = await call(port, "GET", "/__destinations");
+	ok("antes del retarget lista el subaccount viejo", r.json.destinations[0].name === "A");
+	r = await call(port, "POST", "/__target", { org: "OTRO-ORG", space: "OTRO-SPACE" });
+	ok("POST /__target devuelve 200 con el target nuevo", r.status === 200 && r.json.target.org === "OTRO-ORG");
+	r = await call(port, "GET", "/__destinations");
+	ok("DESPUES del retarget lista el subaccount nuevo (contexto mutable)", r.json.destinations[0].name === "OTRA-SUBACCOUNT");
+	r = await call(port, "GET", "/__health");
+	ok("/__health refleja el target nuevo", r.json.target.org === "OTRO-ORG" && r.json.target.space === "OTRO-SPACE");
+
+	// Restaurar para no arrastrar estado a los tests que siguen.
+	ctx.destClient = stub;
+	ctx.cfTarget = { org: "ORG-TEST", space: "SPACE-TEST", user: "yo" };
+
+	// --- probar una destination ---------------------------------------------
+	r = await call(port, "GET", "/__test/EXISTE");
+	ok("GET /__test responde con etapa y ms", r.status === 200 && typeof r.json.stage === "string" && typeof r.json.ms === "number");
+	ok("/__test pasa resolve/auth/route y falla recien al conectar", r.json.stage === "connect" && r.json.ok === false);
+	ok("/__test informa la URL que intento", /no-existe\.invalid/.test(r.json.url || ""));
+	r = await call(port, "GET", "/__test/NO_EXISTE_TEST");
+	// Se compara el MENSAJE, no solo la etapa: un error de plomeria (p.ej. llamar
+	// mal al cliente) tambien cae en "resolve" y pasaria desapercibido.
+	ok("/__test de inexistente corta en resolve con el error del cliente",
+		r.json.stage === "resolve" && r.json.ok === false && /no existe en este subaccount/.test(r.json.error));
+	ok("/__test llamo al cliente de verdad", calls.some((c) => c.fn === "resolve" && c.name === "NO_EXISTE_TEST"));
+	ok("/__test nunca escribe", !calls.some((c) => c.fn === "create" || c.fn === "update" || c.fn === "remove"));
 
 	console.log("");
 	console.log(failed ? failed + " test(s) FALLARON" : "Todos los tests pasaron");

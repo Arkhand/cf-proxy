@@ -19,6 +19,7 @@ const net = require("net");
 const fs = require("fs");
 const path = require("path");
 const { URL } = require("url");
+const cf = require("./cf");
 
 /** Pagina de diagnostico (UI5) que se sirve en `/`. Se lee en cada request para poder editarla sin reiniciar. */
 const UI_PATH = path.resolve(__dirname, "..", "webapp", "index.html");
@@ -286,17 +287,124 @@ function buildTarget(resolved, connectivity, connToken, connectivityNote) {
 }
 
 /**
+ * Prueba una destination: hace UN request de lectura por el mismo camino que
+ * usa el proxy (auth, tunel, connectivity proxy) y devuelve el resultado.
+ *
+ * Es lo que el cockpit llama "Check Connection", pero desde aca: pasa por el
+ * tunel y, en PrincipalPropagation, con tu identidad. Sirve para separar
+ * "la destination esta mal" de "el backend no responde".
+ *
+ * Solo GET, y el cuerpo se descarta: es un diagnostico, no un proxy.
+ */
+function testDestination({ destClient, connectivity, connTokenProvider, connectivityNote, loginHint }) {
+	return async function test(name, { path = "/", userToken = null, timeout = 20000 } = {}) {
+		const started = Date.now();
+		const step = (stage, ok, extra) => ({ stage, ok, ms: Date.now() - started, ...extra });
+
+		// --- 1. Resolver: si falla, el problema es la definicion o el servicio.
+		let resolved;
+		try {
+			resolved = await destClient.resolve(name, userToken);
+		} catch (e) {
+			return step("resolve", false, { error: e.message });
+		}
+
+		const cfg = resolved.config;
+
+		// --- 2. Autenticacion: el servicio ya devolvio (o no) un token usable.
+		const headers = {};
+		const auth = applyAuth(headers, resolved, { userToken, loginHint });
+		if (!auth.ok) {
+			return step("auth", false, { error: auth.error, authentication: cfg.Authentication });
+		}
+
+		// --- 3. Ruta: directo o via Connectivity Proxy.
+		const connToken = connectivity ? await connTokenProvider() : null;
+		const target = buildTarget(resolved, connectivity, connToken, connectivityNote);
+		if (!target.ok) {
+			return step("route", false, { error: target.error, proxyType: cfg.ProxyType });
+		}
+
+		Object.assign(headers, target.extraHeaders || {});
+		headers.host = new URL(cfg.URL).host;
+		headers.accept = "*/*";
+		if (cfg["sap-client"]) {
+			headers["sap-client"] = cfg["sap-client"];
+		}
+
+		const suffix = path.startsWith("/") ? path : "/" + path;
+		const fullPath = target.onPremise
+			? target.absoluteHost + target.basePath + suffix
+			: target.basePath + suffix;
+
+		// --- 4. Request real contra el backend.
+		const client = target.protocol === "https:" ? https : http;
+
+		return new Promise((resolve) => {
+			const req = client.request(
+				{ hostname: target.hostname, port: target.port, path: fullPath, method: "GET", headers, timeout, agent: false },
+				(res) => {
+					// El cuerpo se descarta: solo interesa que el backend haya contestado.
+					res.resume();
+					resolve(step("response", true, {
+						status: res.statusCode,
+						statusText: res.statusMessage,
+						// Estos tres headers son los que explican un 401 tipico.
+						hints: {
+							"www-authenticate": res.headers["www-authenticate"] || null,
+							"content-type": res.headers["content-type"] || null,
+							server: res.headers.server || null
+						},
+						url: cfg.URL + suffix,
+						via: target.onPremise ? `Connectivity Proxy ${target.hostname}:${target.port}` : "directo",
+						authentication: cfg.Authentication
+					}));
+				}
+			);
+
+			req.on("error", (e) => resolve(step("connect", false, {
+				error: describeError(e),
+				url: cfg.URL + suffix,
+				via: target.onPremise ? `Connectivity Proxy ${target.hostname}:${target.port}` : "directo"
+			})));
+			req.on("timeout", () => {
+				req.destroy();
+				resolve(step("connect", false, { error: `timeout tras ${timeout}ms`, url: cfg.URL + suffix }));
+			});
+			req.end();
+		});
+	};
+}
+
+/**
  * Crea el servidor HTTP del proxy.
  *
  * `auth` es el manejador de login de lib/auth.js (siempre presente: si no hay
  * XSUAA propio es un objeto nulo con `configured: false`).
- * `cfTarget` es { org, space, user } de la sesion de CF, solo informativo.
+ *
+ * `ctx` es un objeto MUTABLE con lo que depende del subaccount:
+ * { destClient, connectivity, connTokenProvider, connectivityNote, cfTarget }.
+ * Se lee en cada request, no se captura al crear el servidor: cuando se
+ * cambia de org/space (POST /__target), server.js reemplaza su contenido y
+ * el proxy sigue sirviendo con las credenciales nuevas, sin reiniciar.
+ *
+ * `onRetarget(org, space)` la provee server.js: rehace el descubrimiento.
  */
-function createProxyServer({ destClient, connectivity, connTokenProvider, connectivityNote, auth, cfTarget = null, log }) {
+function createProxyServer({ ctx, auth, onRetarget = null, log }) {
 	// Texto unico para "falta login", usado en los 401 y en la pagina.
 	const loginHint = auth.configured
 		? "Iniciar sesion en /__login (o arrancar con --login)."
 		: auth.reason;
+
+	// Helpers: leen el contexto vigente en cada request.
+	const destClient = () => ctx.destClient;
+	const testOne = (name, opts) => testDestination({
+		destClient: ctx.destClient,
+		connectivity: ctx.connectivity,
+		connTokenProvider: ctx.connTokenProvider,
+		connectivityNote: ctx.connectivityNote,
+		loginHint
+	})(name, opts);
 
 	return http.createServer(async (req, res) => {
 		const send = (status, payload) => {
@@ -356,7 +464,7 @@ function createProxyServer({ destClient, connectivity, connTokenProvider, connec
 				const name = decodeURIComponent(reqUrl.pathname.slice("/__destination/".length));
 				const reveal = reqUrl.searchParams.get("reveal") === "1";
 				try {
-					const resolved = await destClient.resolve(name, userToken);
+					const resolved = await destClient().resolve(name, userToken);
 					return send(200, maskSecrets(toSdkShape(name, resolved), reveal));
 				} catch (e) {
 					return send(404, { error: e.message });
@@ -386,7 +494,7 @@ function createProxyServer({ destClient, connectivity, connTokenProvider, connec
 					const rawMatch = reqUrl.pathname.match(/^\/__destinations\/([^/]+)\/raw$/);
 					if (rawMatch && req.method === "GET") {
 						const name = decodeURIComponent(rawMatch[1]);
-						const def = await destClient.raw(name);
+						const def = await destClient().raw(name);
 						if (!def) {
 							return send(404, { error: `La destination \`${name}\` no existe en este subaccount.` });
 						}
@@ -395,7 +503,7 @@ function createProxyServer({ destClient, connectivity, connTokenProvider, connec
 
 					if (reqUrl.pathname === "/__destinations/preview" && req.method === "POST") {
 						const { action, config, replace } = await readJsonBody(req);
-						const pv = await destClient.preview(action, config, { replace: Boolean(replace) });
+						const pv = await destClient().preview(action, config, { replace: Boolean(replace) });
 
 						// El diff trae valores reales de la definicion guardada: los de
 						// propiedades secretas se ocultan antes de mandarlos al browser.
@@ -414,7 +522,7 @@ function createProxyServer({ destClient, connectivity, connTokenProvider, connec
 
 					if (reqUrl.pathname === "/__destinations" && req.method === "POST") {
 						const { config, confirm } = await readJsonBody(req);
-						const result = await destClient.create(config, { confirm });
+						const result = await destClient().create(config, { confirm });
 						log(`  OK  destination creada: ${result.name}`);
 						return send(201, result);
 					}
@@ -424,7 +532,7 @@ function createProxyServer({ destClient, connectivity, connTokenProvider, connec
 						const name = decodeURIComponent(updMatch[1]);
 						const { config, confirm, replace } = await readJsonBody(req);
 						// El nombre viene de la URL: el body no puede renombrar.
-						const result = await destClient.update({ ...config, Name: name }, { confirm, replace: Boolean(replace) });
+						const result = await destClient().update({ ...config, Name: name }, { confirm, replace: Boolean(replace) });
 						log(`  OK  destination actualizada: ${result.name}`);
 						return send(200, result);
 					}
@@ -432,7 +540,7 @@ function createProxyServer({ destClient, connectivity, connTokenProvider, connec
 					if (updMatch && req.method === "DELETE") {
 						const name = decodeURIComponent(updMatch[1]);
 						const { confirm } = await readJsonBody(req);
-						const result = await destClient.remove(name, { confirm });
+						const result = await destClient().remove(name, { confirm });
 						// El backup queda tambien en la consola del proxy (sin secretos):
 						// si la pagina se cerro, es lo que permite recrearla con create.
 						log(`  !!  destination ELIMINADA: ${result.name}. Definicion para recrearla (sin secretos):`);
@@ -449,8 +557,58 @@ function createProxyServer({ destClient, connectivity, connTokenProvider, connec
 
 			// --- Endpoint propio: lista las destinations disponibles ------------
 			if (req.url === "/__destinations") {
-				const all = await destClient.list();
+				const all = await destClient().list();
 				return send(200, { count: all.length, destinations: all });
+			}
+
+			// --- Endpoints propios: cambiar de org/space sin reiniciar ----------
+			//
+			//   GET  /__targets   orgs y spaces accesibles (para el selector)
+			//   POST /__target    { org, space } -> reapunta y rehace el descubrimiento
+			//
+			// Cambiar de target reemplaza credenciales, tunel y cache: lo hace
+			// server.js via onRetarget, porque es quien sabe armarlos.
+			if (reqUrl.pathname === "/__targets" && req.method === "GET") {
+				if (!onRetarget) {
+					return send(501, { error: "Este proxy no permite cambiar de target." });
+				}
+				const targets = await cf.listTargets();
+				return send(200, { current: ctx.cfTarget, targets });
+			}
+
+			if (reqUrl.pathname === "/__target" && req.method === "POST") {
+				if (!onRetarget) {
+					return send(501, { error: "Este proxy no permite cambiar de target." });
+				}
+				try {
+					const { org, space } = await readJsonBody(req);
+					if (!org || !space) {
+						throw new Error("Faltan `org` y/o `space`.");
+					}
+					const result = await onRetarget(org, space);
+					if (!result.ok) {
+						return send(400, { error: result.error });
+					}
+					return send(200, { target: ctx.cfTarget });
+				} catch (e) {
+					return send(400, { error: e.message });
+				}
+			}
+
+			// --- Endpoint propio: probar UNA destination ------------------------
+			//
+			//   GET /__test/<nombre>?path=/algo
+			//
+			// Hace un GET real por el mismo camino que usaria el proxy y devuelve
+			// en que etapa se cortó. No escribe nada.
+			if (reqUrl.pathname.startsWith("/__test/")) {
+				const name = decodeURIComponent(reqUrl.pathname.slice("/__test/".length));
+				const result = await testOne(name, {
+					path: reqUrl.searchParams.get("path") || "/",
+					userToken
+				});
+				log(`${result.ok ? "OK " : "ERR"} test ${name} -> ${result.stage}${result.status ? " " + result.status : ""}`);
+				return send(200, result);
 			}
 
 			// --- Endpoint propio: estado del proxy ------------------------------
@@ -459,11 +617,12 @@ function createProxyServer({ destClient, connectivity, connTokenProvider, connec
 					ok: true,
 					// Org/space/usuario del target de CF. La pagina lo muestra antes
 					// de cualquier escritura: es el subaccount que se va a tocar.
-					target: cfTarget,
-					onPremise: Boolean(connectivity),
-					connectivity: connectivity
-						? `disponible via ${connectivity.proxyHost}:${connectivity.proxyPort}`
-						: `no disponible (solo destinations de Internet). ${connectivityNote}`,
+					target: ctx.cfTarget,
+					canRetarget: Boolean(onRetarget),
+					onPremise: Boolean(ctx.connectivity),
+					connectivity: ctx.connectivity
+						? `disponible via ${ctx.connectivity.proxyHost}:${ctx.connectivity.proxyPort}`
+						: `no disponible (solo destinations de Internet). ${ctx.connectivityNote}`,
 					// Estado del login: la pagina lo usa para clasificar las PP.
 					login: auth.status(),
 					uso: "http://localhost:<puerto>/<NOMBRE_DESTINATION>/<path>"
@@ -486,7 +645,7 @@ function createProxyServer({ destClient, connectivity, connTokenProvider, connec
 			// --- Resolver la destination (cacheado) -----------------------------
 			let resolved;
 			try {
-				resolved = await destClient.resolve(destName, userToken);
+				resolved = await destClient().resolve(destName, userToken);
 			} catch (e) {
 				return send(404, { error: e.message, ayuda: "GET /__destinations lista las disponibles." });
 			}
@@ -503,8 +662,8 @@ function createProxyServer({ destClient, connectivity, connTokenProvider, connec
 			}
 
 			// --- Elegir ruta (directo vs connectivity proxy) --------------------
-			const connToken = connectivity ? await connTokenProvider() : null;
-			const target = buildTarget(resolved, connectivity, connToken, connectivityNote);
+			const connToken = ctx.connectivity ? await ctx.connTokenProvider() : null;
+			const target = buildTarget(resolved, ctx.connectivity, connToken, ctx.connectivityNote);
 			if (!target.ok) {
 				return send(501, { error: target.error, destination: destName });
 			}
@@ -554,4 +713,4 @@ function createProxyServer({ destClient, connectivity, connTokenProvider, connec
 	});
 }
 
-module.exports = { createProxyServer, applyAuth, buildTarget, probeTcp, describeError, USER_AUTH_TYPES };
+module.exports = { createProxyServer, applyAuth, buildTarget, testDestination, probeTcp, describeError, USER_AUTH_TYPES };
