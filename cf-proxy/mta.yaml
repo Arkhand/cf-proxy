@@ -1,0 +1,86 @@
+# Recursos de BTP que cf-proxy necesita para llegar a destinations con
+# PrincipalPropagation desde la PC. Se despliega UNA vez por space:
+#
+#     npm run deploy        (mbt build + cf deploy)
+#     npm run undeploy      (borra todo: app, instancias y service keys)
+#
+# Que crea y para que. Los nombres son fijos a proposito: cf-proxy los busca
+# por nombre exacto y, si existen, los usa directo sin revisar el resto del space.
+#
+#   cf-dest-xsuaa          Cliente OAuth propio. Es la unica pieza que NO se
+#                          puede reutilizar de otra app: sus redirect-uris
+#                          tienen que apuntar a http://localhost para que el
+#                          login desde la PC funcione. Ver xs-security.json.
+#
+#   cf-dest-destination    Para listar y resolver destinations.
+#   cf-dest-connectivity   Para llegar al Cloud Connector (on-premise).
+#                          Ambos con service key lista (cf-dest-key), asi
+#                          cf-proxy no tiene que crear ninguna.
+#
+#   cf-dest-app            App minima, sin ruta, con SSH habilitado. Existe
+#                          solo para que `cf ssh -L` tenga por donde abrir el
+#                          port-forward al Connectivity Proxy. No sirve trafico.
+#
+# Nada del subaccount se toca: no modifica destinations, ni otras apps, ni
+# sus XSUAA. Todo lo creado lleva el prefijo cf-dest- y se va con undeploy.
+
+_schema-version: "3.3"
+ID: cf-dest
+version: 1.0.0
+
+parameters:
+  enable-parallel-deployments: true
+
+modules:
+  # ---------------------------------------------------------------------------
+  # App para el port-forward SSH. 128M es el minimo razonable para el buildpack
+  # de Node; no hace nada mas que quedarse viva.
+  # ---------------------------------------------------------------------------
+  - name: cf-dest-app
+    type: nodejs
+    path: cf-dest-app
+    parameters:
+      memory: 128M
+      disk-quota: 256M
+      instances: 1
+      no-route: true
+      health-check-type: process
+      enable-ssh: true
+    build-parameters:
+      ignore: ["node_modules/"]
+    # Los requires no se usan en runtime: estan para que el deployer cree los
+    # recursos aunque ningun otro modulo los pida.
+    requires:
+      - name: cf-dest-xsuaa
+      - name: cf-dest-destination
+      - name: cf-dest-connectivity
+
+resources:
+  # ---------------------------------------------------------------------------
+  # XSUAA propio. Toda la config (xsappname, redirect-uris, validez de tokens)
+  # esta en xs-security.json.
+  # ---------------------------------------------------------------------------
+  - name: cf-dest-xsuaa
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: xsuaa
+      service-plan: application
+      path: ./xs-security.json
+      service-keys:
+        - name: cf-dest-key
+
+  - name: cf-dest-destination
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: destination
+      service-plan: lite
+      service-keys:
+        - name: cf-dest-key
+
+  - name: cf-dest-connectivity
+    type: org.cloudfoundry.managed-service
+    parameters:
+      service: connectivity
+      service-plan: lite
+      service-keys:
+        - name: cf-dest-key

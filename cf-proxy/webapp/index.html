@@ -1,0 +1,841 @@
+<!DOCTYPE html>
+<html lang="es">
+<head>
+	<meta charset="utf-8">
+	<meta name="viewport" content="width=device-width, initial-scale=1">
+	<title>cf-proxy</title>
+	<!-- Favicon vacio: evita el 404 en consola que el browser pide por default. -->
+	<link rel="icon" href="data:,">
+	<!--
+		Pagina de diagnostico de cf-proxy. La sirve el propio proxy en `/`.
+
+		No es una app UI5 con manifest ni build: es un unico HTML que carga
+		sap.m desde el CDN publico y arma la vista en JS. Alcanza para lo que
+		hace (listar, filtrar, ver detalle, chequear estado, crear y editar) y no
+		agrega pasos.
+
+		Datos que consume, todos del mismo proxy:
+		  GET  /__health                    estado, target de CF y acceso on-premise
+		  GET  /__destinations              listado (sin credenciales)
+		  GET  /__destination/<nombre>      detalle resuelto, forma del Cloud SDK
+		  GET  /__destinations/<nombre>/raw definicion guardada, sin secretos (para editar)
+		  POST /__destinations/preview      diff de lo que se escribiria; no escribe
+		  POST /__destinations              crear   (exige confirm = nombre)
+		  PUT  /__destinations/<nombre>     actualizar (exige confirm = nombre)
+		  DELETE /__destinations/<nombre>   eliminar (exige confirm = nombre; devuelve backup)
+	-->
+	<script id="sap-ui-bootstrap"
+		src="https://ui5.sap.com/resources/sap-ui-core.js"
+		data-sap-ui-theme="sap_horizon"
+		data-sap-ui-libs="sap.m"
+		data-sap-ui-compat-version="edge"
+		data-sap-ui-async="true"></script>
+	<style>
+		/* sap.m.Page mide 100% de su contenedor: sin esto la pagina queda con altura 0. */
+		html, body, #content { height: 100%; margin: 0; }
+		pre.cfp-json {
+			margin: 0;
+			padding: 0.75rem;
+			font: 12px/1.45 Consolas, "Courier New", monospace;
+			white-space: pre-wrap;
+			word-break: break-all;
+			background: #f5f6f7;
+			border-radius: 0.5rem;
+			max-height: 60vh;
+			overflow: auto;
+		}
+		.cfp-url { font-family: Consolas, "Courier New", monospace; }
+	</style>
+</head>
+<body class="sapUiBody">
+<div id="content"></div>
+<script>
+sap.ui.getCore().attachInit(function () {
+	sap.ui.require([
+		"sap/m/Page", "sap/m/Panel", "sap/m/Table", "sap/m/Column", "sap/m/ColumnListItem",
+		"sap/m/Text", "sap/m/Link", "sap/m/ObjectStatus", "sap/m/Button", "sap/m/SearchField",
+		"sap/m/Toolbar", "sap/m/ToolbarSpacer", "sap/m/Title", "sap/m/Label", "sap/m/Dialog",
+		"sap/m/MessageStrip", "sap/m/VBox", "sap/m/HBox", "sap/m/CheckBox", "sap/ui/core/BusyIndicator",
+		"sap/ui/core/HTML", "sap/ui/model/json/JSONModel", "sap/ui/model/Filter", "sap/ui/model/FilterOperator",
+		"sap/m/Input", "sap/m/ComboBox", "sap/ui/core/Item", "sap/m/MessageToast"
+	], function (Page, Panel, Table, Column, ColumnListItem, Text, Link, ObjectStatus, Button, SearchField,
+		Toolbar, ToolbarSpacer, Title, Label, Dialog, MessageStrip, VBox, HBox, CheckBox, BusyIndicator,
+		HTML, JSONModel, Filter, FilterOperator, Input, ComboBox, Item, MessageToast) {
+
+		var base = location.origin;
+		var model = new JSONModel({ destinations: [], health: null, count: 0, target: "desconocido" });
+
+		// ---------------------------------------------------------------
+		// Clasificacion: la misma regla que usa el proxy para decidir si una
+		// destination va a funcionar. Se calcula en el browser para no
+		// duplicar un endpoint solo por esto.
+		// ---------------------------------------------------------------
+		function classify(d, health) {
+			var login = health && health.login;
+			if (d.auth === "PrincipalPropagation") {
+				if (!login || !login.configured) {
+					return { state: "Error", text: "Requiere XSUAA propio (npm run deploy)" };
+				}
+				if (!login.loggedIn) {
+					return { state: "Warning", text: "Requiere iniciar sesión" };
+				}
+				if (!health.onPremise) {
+					return { state: "Warning", text: "On-prem: requiere túnel" };
+				}
+				return { state: "Success", text: "OK (como " + login.user.name + ")" };
+			}
+			var authOk = d.auth === "BasicAuthentication" || d.auth === "NoAuthentication" ||
+				String(d.auth).indexOf("OAuth2") === 0;
+			if (!authOk) {
+				return { state: "Warning", text: "Auth no soportada: " + d.auth };
+			}
+			if (d.proxyType === "OnPremise") {
+				return health && health.onPremise
+					? { state: "Success", text: "OK (on-prem vía túnel)" }
+					: { state: "Warning", text: "On-prem: requiere túnel" };
+			}
+			return { state: "Success", text: "OK" };
+		}
+
+		// ---------------------------------------------------------------
+		// Carga de datos
+		// ---------------------------------------------------------------
+		function describeHealth(h) {
+			if (!h || !h.ok) {
+				return { type: "Error", text: "Proxy no responde: " + ((h && h.error) || "") };
+			}
+			var login = h.login || {};
+			var who = !login.configured
+				? "Login: no disponible (" + (login.reason || "sin XSUAA propio") + ")"
+				: login.loggedIn
+					? "Sesión: " + login.user.name + (login.user.email ? " <" + login.user.email + ">" : "") + ", vence " + login.expiresAt
+					: "Sesión: sin iniciar (necesaria para PrincipalPropagation)";
+			return {
+				type: login.configured && !login.loggedIn ? "Warning" : "Success",
+				text: "Proxy vivo. On-premise: " + (h.onPremise ? "disponible" : "no disponible") + ". " + who
+			};
+		}
+
+		function loadHealth() {
+			return fetch(base + "/__health").then(function (r) { return r.json(); })
+				.catch(function (e) { return { ok: false, error: String(e) }; })
+				.then(function (h) {
+					var d = describeHealth(h);
+					model.setProperty("/health", h);
+					model.setProperty("/healthText", d.text);
+					model.setProperty("/healthType", d.type);
+					model.setProperty("/canLogin", Boolean(h.login && h.login.configured && !h.login.loggedIn));
+					model.setProperty("/canLogout", Boolean(h.login && h.login.loggedIn));
+					// Org/space que se va a tocar al crear/editar: se muestra en todos los dialogos.
+					model.setProperty("/target", h.target ? h.target.org + " / " + h.target.space + "  (" + h.target.user + ")" : "desconocido");
+					return h.ok ? h : null;
+				});
+		}
+
+		function loadDestinations(health) {
+			return fetch(base + "/__destinations").then(function (r) { return r.json(); })
+				.then(function (body) {
+					var rows = (body.destinations || []).map(function (d) {
+						var c = classify(d, health);
+						d.state = c.state; d.stateText = c.text;
+						d.proxyUrl = base + "/" + encodeURIComponent(d.name) + "/";
+						return d;
+					}).sort(function (a, b) { return a.name.localeCompare(b.name); });
+					model.setProperty("/destinations", rows);
+					model.setProperty("/count", rows.length);
+				});
+		}
+
+		function reload() {
+			BusyIndicator.show(0);
+			loadHealth().then(loadDestinations).finally(function () { BusyIndicator.hide(); });
+		}
+
+		// ---------------------------------------------------------------
+		// Dialogo de detalle: el JSON con la forma de getDestination() del
+		// Cloud SDK. Los secretos van ocultos salvo que se marque el check.
+		// ---------------------------------------------------------------
+		function showDetail(name) {
+			var pre = new HTML({ content: "<pre class='cfp-json'>cargando…</pre>" });
+			var reveal = new CheckBox({ text: "Mostrar secretos", selected: false });
+
+			function fetchDetail() {
+				var url = base + "/__destination/" + encodeURIComponent(name) + (reveal.getSelected() ? "?reveal=1" : "");
+				fetch(url).then(function (r) { return r.json(); }).then(function (json) {
+					var txt = JSON.stringify(json, null, 2)
+						.replace(/&/g, "&amp;").replace(/</g, "&lt;");
+					pre.setContent("<pre class='cfp-json'>" + txt + "</pre>");
+				});
+			}
+			reveal.attachSelect(fetchDetail);
+
+			var dlg = new Dialog({
+				title: name,
+				contentWidth: "48rem",
+				content: [
+					new VBox({ items: [
+						new MessageStrip({ text: "Misma forma que devuelve getDestination() de @sap-cloud-sdk/connectivity.", showIcon: true }).addStyleClass("sapUiSmallMarginBottom"),
+						new HBox({ items: [
+							new Label({ text: "URL via proxy:" }).addStyleClass("sapUiTinyMarginEnd"),
+							new Link({ text: base + "/" + name + "/", href: base + "/" + name + "/", target: "_blank" }).addStyleClass("cfp-url")
+						] }).addStyleClass("sapUiSmallMarginBottom"),
+						reveal,
+						pre
+					] }).addStyleClass("sapUiSmallMargin")
+				],
+				endButton: new Button({ text: "Cerrar", press: function () { dlg.close(); } }),
+				afterClose: function () { dlg.destroy(); }
+			});
+			dlg.open();
+			fetchDetail();
+		}
+
+		// ---------------------------------------------------------------
+		// Edicion: crear o actualizar una destination.
+		//
+		// Siempre en dos pasos, porque se escribe sobre el subaccount entero
+		// del target de CF (que puede ser de un cliente):
+		//   1. Formulario   -> POST /__destinations/preview   (no escribe)
+		//   2. Confirmacion -> muestra el diff y exige tipear el nombre
+		//                   -> POST /__destinations  o  PUT /__destinations/<n>
+		// El guard de `confirm` esta en el servidor: sin el nombre exacto en
+		// el body no se escribe, haga lo que haga esta pagina.
+		//
+		// Como se aguanta un cambio de estructura sin romperse:
+		//   - Los tipos de auth y sus campos son DATOS (AUTH_TYPES), no codigo:
+		//     un tipo nuevo es una linea mas. Un tipo que no esta en la tabla
+		//     se acepta igual (el combo admite texto libre), sin campos propios.
+		//   - Toda propiedad que el formulario no conoce va a "Parametros
+		//     adicionales" (clave/valor) y se conserva al guardar.
+		//   - Quitar una propiedad, o cambiar de tipo de auth (que quita las del
+		//     tipo anterior), se manda como null: el servidor la elimina y el
+		//     preview lo muestra como "(SE QUITA)" antes de confirmar.
+		//   - Los secretos guardados no se muestran (el proxy no los manda):
+		//     dejar el campo vacio = conservar el guardado.
+		// ---------------------------------------------------------------
+
+		// Campos propios de cada tipo de autenticacion.
+		//
+		// Fuente: SAP Help > SAP BTP Connectivity > HTTP Destinations, una pagina
+		// por tipo (repo SAP-docs/btp-connectivity, docs/1-connectivity-documentation,
+		// verificado 2026-09-20). Se replican las tablas "Required" y "Optional"
+		// de cada pagina. Las "Additional" con prefijo (URL.headers.X,
+		// URL.queries.X, tokenServiceURL.headers.X, tokenService.body.X) son
+		// claves libres: van en Parametros adicionales.
+		//
+		// secret = no se muestra el guardado; required = obligatorio al crear.
+		var F = function (key, label, extra) {
+			var f = { key: key, label: label };
+			if (extra) { Object.keys(extra).forEach(function (k) { f[k] = extra[k]; }); }
+			return f;
+		};
+		var BOOL = ["true", "false"];
+		var PROXY_TYPES = ["Internet", "OnPremise", "PrivateLink"];
+
+		// Bloques que se repiten entre los flujos OAuth.
+		var OAUTH_CLIENT = [
+			F("clientId", "Client ID", { required: true }),
+			F("clientSecret", "Client Secret", { secret: true }),
+			F("tokenServiceURL", "Token Service URL", { required: true })
+		];
+		var TOKEN_SERVICE_BASIC = [
+			F("tokenServiceUser", "Token Service User"),
+			F("tokenServicePassword", "Token Service Password", { secret: true })
+		];
+		var TOKEN_SERVICE_URL_TYPE = [
+			F("tokenServiceURLType", "Token Service URL Type", { select: ["Dedicated", "Common"] })
+		];
+		var TOKEN_SERVICE_OPT = [
+			F("tokenServiceURL.ProxyType", "Token Service Proxy Type", { select: PROXY_TYPES }),
+			F("tokenService.KeyStoreLocation", "Token Service Key Store (mTLS)"),
+			F("tokenService.KeyStorePassword", "Token Service Key Store Password", { secret: true }),
+			F("scope", "Scope")
+		];
+		var SAML_OPT = [
+			F("nameQualifier", "Name Qualifier"),
+			F("assertionIssuer", "Assertion Issuer"),
+			F("assertionRecipient", "Assertion Recipient"),
+			F("nameIdFormat", "NameID Format"),
+			F("userIdSource", "User ID Source"),
+			F("KeyStoreLocation", "Key Store Location (firma)"),
+			F("KeyStorePassword", "Key Store Password", { secret: true }),
+			F("skipUserAttributesPrefixInSAMLAttributes", "Skip user attributes prefix", { select: BOOL }),
+			F("includeSigningCertificateInSAMLAssertion", "Include signing certificate", { select: BOOL }),
+			F("skipUserUuidInSAMLAttributes", "Skip user_uuid attribute", { select: BOOL }),
+			F("companyId", "Company ID")
+		];
+
+		var AUTH_TYPES = {
+			NoAuthentication: [],
+			BasicAuthentication: [
+				F("User", "Usuario", { required: true }),
+				F("Password", "Contraseña", { secret: true, required: true }),
+				F("Preemptive", "Preemptive", { select: ["TRUE", "FALSE"] })
+			],
+			ClientCertificateAuthentication: [
+				F("KeyStoreLocation", "Key Store Location"),
+				F("KeyStorePassword", "Key Store Password", { secret: true }),
+				F("KeyStore.Source", "Key Store Source")
+			],
+			PrincipalPropagation: [],
+			OAuth2ClientCredentials: OAUTH_CLIENT.concat(TOKEN_SERVICE_BASIC, TOKEN_SERVICE_URL_TYPE, TOKEN_SERVICE_OPT),
+			OAuth2UserTokenExchange: OAUTH_CLIENT.concat(TOKEN_SERVICE_URL_TYPE, TOKEN_SERVICE_OPT),
+			OAuth2JWTBearer: OAUTH_CLIENT.concat(TOKEN_SERVICE_URL_TYPE, TOKEN_SERVICE_OPT),
+			OAuth2TokenExchange: OAUTH_CLIENT.concat(TOKEN_SERVICE_OPT),
+			OAuth2RefreshToken: OAUTH_CLIENT.concat(TOKEN_SERVICE_URL_TYPE, TOKEN_SERVICE_OPT),
+			OAuth2AuthorizationCode: OAUTH_CLIENT.concat(TOKEN_SERVICE_URL_TYPE, TOKEN_SERVICE_OPT),
+			OAuth2TechnicalUserPropagation: OAUTH_CLIENT.concat(TOKEN_SERVICE_BASIC, TOKEN_SERVICE_URL_TYPE, TOKEN_SERVICE_OPT),
+			OAuth2Password: [
+				F("clientId", "Client ID", { required: true }),
+				F("clientSecret", "Client Secret", { secret: true }),
+				F("User", "Usuario", { required: true }),
+				F("Password", "Contraseña", { secret: true, required: true }),
+				F("tokenServiceURL", "Token Service URL", { required: true })
+			].concat(TOKEN_SERVICE_OPT),
+			OAuth2SAMLBearerAssertion: [
+				F("audience", "Audience", { required: true }),
+				F("clientKey", "Client Key", { required: true }),
+				F("tokenServiceURL", "Token Service URL", { required: true }),
+				F("authnContextClassRef", "AuthnContextClassRef", { required: true }),
+				F("SAMLAssertionProvider", "SAML Assertion Provider")
+			].concat(TOKEN_SERVICE_BASIC, TOKEN_SERVICE_URL_TYPE, TOKEN_SERVICE_OPT, SAML_OPT),
+			SAMLAssertion: [
+				F("audience", "Audience", { required: true }),
+				F("authnContextClassRef", "AuthnContextClassRef", { required: true }),
+				F("clientKey", "Client Key")
+			].concat(SAML_OPT)
+		};
+
+		// TLS del lado servidor: aplica a cualquier destination HTTPS, sea cual
+		// sea la autenticacion (pagina "Server Certificate Authentication").
+		var TLS_FIELDS = [
+			F("TrustAll", "Trust All (no verificar certificado)", { select: ["TRUE", "FALSE"] }),
+			F("TrustStoreLocation", "Trust Store Location"),
+			F("TrustStorePassword", "Trust Store Password", { secret: true }),
+			F("HostnameVerifier", "Hostname Verifier", { select: ["Strict", "BrowserCompatible"] })
+		];
+
+		// Campos comunes a toda destination. onlyNew = solo al crear (el nombre
+		// no se edita: eso seria otra destination). when = visible segun otro campo.
+		var BASE_FIELDS = [
+			{ key: "Name", label: "Nombre", required: true, onlyNew: true },
+			{ key: "Description", label: "Descripción" },
+			{ key: "URL", label: "URL", required: true },
+			{ key: "Type", label: "Tipo", select: ["HTTP", "RFC", "MAIL", "LDAP"], def: "HTTP" },
+			{ key: "ProxyType", label: "Proxy", select: ["Internet", "OnPremise", "PrivateLink"], def: "Internet" },
+			{ key: "CloudConnectorLocationId", label: "Location ID (Cloud Connector)", when: function (v) { return v.ProxyType === "OnPremise"; } },
+			{ key: "Authentication", label: "Autenticación", select: Object.keys(AUTH_TYPES), required: true, def: "NoAuthentication" }
+		];
+
+		function authFields(type) { return AUTH_TYPES[type] || []; }
+		function isBaseKey(k) { return BASE_FIELDS.some(function (f) { return f.key === k; }); }
+
+		function postJson(method, url, body) {
+			return fetch(url, {
+				method: method,
+				headers: { "content-type": "application/json" },
+				body: JSON.stringify(body)
+			}).then(function (r) {
+				return r.json().then(function (json) {
+					if (!r.ok) { throw new Error(json.error || ("HTTP " + r.status)); }
+					return json;
+				});
+			});
+		}
+
+		function formRow(label, control, required) {
+			return new HBox({ alignItems: "Center", items: [
+				new Label({ text: label, width: "15rem", required: !!required }),
+				control
+			] }).addStyleClass("sapUiTinyMarginBottom");
+		}
+
+		// Tabla Propiedad / Valor de un objeto plano (para confirmar y eliminar).
+		function propertyTable(obj) {
+			return new Table({
+				columns: [
+					new Column({ header: new Text({ text: "Propiedad" }), width: "15rem" }),
+					new Column({ header: new Text({ text: "Valor" }) })
+				],
+				items: Object.keys(obj).map(function (k) {
+					return new ColumnListItem({ cells: [ new Text({ text: k }), new Text({ text: String(obj[k]) }) ] });
+				})
+			});
+		}
+
+		// Arma el formulario sobre `current` (definicion guardada, sin secretos;
+		// {} si es nueva). Devuelve { box, getConfig }: getConfig arma el objeto
+		// a mandar, con null en lo que hay que quitar, o lanza si falta algo.
+		function buildForm(current, isNew) {
+			var ctl = {};        // campos base: key -> control
+			var authCtl = {};    // campos del tipo de auth elegido: key -> control
+			var tlsCtl = {};     // campos TLS del servidor: key -> control
+			var whenRows = [];   // filas con visibilidad condicionada
+			var extraRows = [];  // parametros adicionales: { keyIn, valIn, row }
+			var authAtOpen = current.Authentication || "";
+			var authBox = new VBox();
+			var tlsBox = new VBox();
+			var extraBox = new VBox();
+
+			function makeInput(f, value) {
+				var c;
+				if (f.select) {
+					c = new ComboBox({ width: "26rem", items: f.select.map(function (o) { return new Item({ key: o, text: o }); }) });
+					c.setValue(value || "");
+				} else {
+					c = new Input({ width: "26rem", type: f.secret ? "Password" : "Text", value: value || "" });
+				}
+				if (f.secret && !isNew) { c.setPlaceholder("(guardado; dejar vacío para conservarlo)"); }
+				return c;
+			}
+
+			function baseValues() {
+				var v = {};
+				Object.keys(ctl).forEach(function (k) { v[k] = (ctl[k].getValue() || "").trim(); });
+				return v;
+			}
+			function refreshWhen() {
+				var v = baseValues();
+				whenRows.forEach(function (w) { w.row.setVisible(w.when(v)); });
+			}
+
+			// --- Campos base -------------------------------------------------
+			var baseBox = new VBox();
+			BASE_FIELDS.forEach(function (f) {
+				if (f.onlyNew && !isNew) { return; }
+				var c = makeInput(f, isNew ? (f.def || "") : (current[f.key] || ""));
+				c.attachChange(refreshWhen);
+				ctl[f.key] = c;
+				var r = formRow(f.label, c, f.required);
+				if (f.when) { whenRows.push({ row: r, when: f.when }); }
+				baseBox.addItem(r);
+			});
+
+			// --- Campos del tipo de autenticacion: se rearman al cambiar -----
+			function renderAuth() {
+				var type = (ctl.Authentication.getValue() || "").trim();
+				authBox.destroyItems();
+				authCtl = {};
+				authFields(type).forEach(function (f) {
+					var c = makeInput(f, current[f.key] || "");
+					authCtl[f.key] = c;
+					authBox.addItem(formRow(f.label, c, f.required));
+				});
+				if (type && !AUTH_TYPES[type]) {
+					authBox.addItem(new MessageStrip({ type: "Information", showIcon: true,
+						text: "Tipo no catalogado en esta página: se acepta igual; sus propiedades van en Parámetros adicionales." }));
+				}
+			}
+			ctl.Authentication.attachChange(renderAuth);
+			ctl.Authentication.attachSelectionChange(renderAuth);
+			renderAuth();
+			refreshWhen();
+
+			// --- TLS del servidor: siempre, independiente del tipo de auth ------
+			TLS_FIELDS.forEach(function (f) {
+				var c = makeInput(f, current[f.key] || "");
+				tlsCtl[f.key] = c;
+				tlsBox.addItem(formRow(f.label, c, false));
+			});
+
+			// --- Parametros adicionales: todo lo que el formulario no conoce ---
+			function addExtra(k, v) {
+				var keyIn = new Input({ width: "14rem", value: k || "", placeholder: "clave" });
+				var valIn = new Input({ width: "20rem", value: v || "", placeholder: "valor" }).addStyleClass("sapUiTinyMarginBegin");
+				var entry = { keyIn: keyIn, valIn: valIn };
+				entry.row = new HBox({ alignItems: "Center", items: [
+					keyIn, valIn,
+					new Button({ icon: "sap-icon://decline", tooltip: "Quitar", press: function () {
+						extraBox.removeItem(entry.row); entry.row.destroy();
+						extraRows.splice(extraRows.indexOf(entry), 1);
+					} }).addStyleClass("sapUiTinyMarginBegin")
+				] }).addStyleClass("sapUiTinyMarginBottom");
+				extraRows.push(entry);
+				extraBox.addItem(entry.row);
+			}
+			var initialExtraKeys = Object.keys(current).filter(function (k) {
+				var known = authFields(authAtOpen).concat(TLS_FIELDS);
+				return !isBaseKey(k) && !known.some(function (f) { return f.key === k; });
+			});
+			initialExtraKeys.forEach(function (k) { addExtra(k, current[k]); });
+
+			var box = new VBox({ items: [
+				baseBox,
+				new Title({ text: "Autenticación" }).addStyleClass("sapUiTinyMarginTop sapUiTinyMarginBottom"),
+				authBox,
+				new Title({ text: "Servidor (TLS) — opcional" }).addStyleClass("sapUiTinyMarginTop sapUiTinyMarginBottom"),
+				tlsBox,
+				new HBox({ alignItems: "Center", items: [
+					new Title({ text: "Parámetros adicionales" }),
+					new Button({ text: "Agregar", icon: "sap-icon://add", press: function () { addExtra("", ""); } }).addStyleClass("sapUiTinyMarginBegin")
+				] }).addStyleClass("sapUiTinyMarginTop sapUiTinyMarginBottom"),
+				extraBox
+			] });
+
+			// Arma el objeto a mandar. Reglas: vacio en un campo que existia = null
+			// (quitar); vacio en un secreto = no se manda (conservar); al cambiar
+			// de tipo de auth, los campos del tipo anterior van en null.
+			function getConfig() {
+				var cfg = {};
+				var missing = [];
+				var val = function (c) { return (c.getValue() || "").trim(); };
+				var bv = baseValues();
+
+				BASE_FIELDS.forEach(function (f) {
+					if (f.onlyNew && !isNew) { return; }
+					if (f.when && !f.when(bv)) {
+						if (current[f.key] !== undefined) { cfg[f.key] = null; }
+						return;
+					}
+					var v = bv[f.key];
+					if (!v) {
+						if (f.required) { missing.push(f.label); }
+						else if (current[f.key] !== undefined) { cfg[f.key] = null; }
+						return;
+					}
+					cfg[f.key] = v;
+				});
+
+				var type = cfg.Authentication || "";
+				var typeChanged = type !== authAtOpen;
+				authFields(type).forEach(function (f) {
+					var v = val(authCtl[f.key]);
+					if (v) { cfg[f.key] = v; return; }
+					if (f.secret) {
+						// Vacio = conservar el guardado. Salvo que no pueda haber nada
+						// guardado (nueva, o recien cambiado a este tipo): ahi es obligatorio.
+						if (f.required && (isNew || typeChanged)) { missing.push(f.label); }
+						return;
+					}
+					if (f.required) { missing.push(f.label); }
+					else if (current[f.key] !== undefined) { cfg[f.key] = null; }
+				});
+
+				TLS_FIELDS.forEach(function (f) {
+					var v = val(tlsCtl[f.key]);
+					if (v) { cfg[f.key] = v; return; }
+					if (f.secret) { return; }
+					if (current[f.key] !== undefined) { cfg[f.key] = null; }
+				});
+
+				if (!isNew && typeChanged) {
+					var keep = {};
+					authFields(type).forEach(function (f) { keep[f.key] = true; });
+					authFields(authAtOpen).forEach(function (f) {
+						if (!keep[f.key] && cfg[f.key] === undefined) { cfg[f.key] = null; }
+					});
+				}
+
+				var seen = {};
+				extraRows.forEach(function (e) {
+					var k = val(e.keyIn);
+					if (!k) { return; }
+					seen[k] = true;
+					cfg[k] = val(e.valIn);
+				});
+				initialExtraKeys.forEach(function (k) {
+					if (!seen[k] && cfg[k] === undefined) { cfg[k] = null; }
+				});
+
+				if (missing.length) { throw new Error("Faltan campos obligatorios: " + missing.join(", ") + "."); }
+				return cfg;
+			}
+
+			return { box: box, getConfig: getConfig };
+		}
+
+		// Paso 2: diff + confirmacion por nombre. `onDone` se llama solo si se escribio.
+		function confirmWrite(action, config, preview, onDone) {
+			var name = config.Name;
+			var error = new MessageStrip({ type: "Error", showIcon: true, visible: false });
+			var typed = new Input({ width: "100%", placeholder: "Escribí el nombre exacto para confirmar: " + name });
+
+			// Si el preview ya sabe que va a fallar (409 / 404), no hay nada que confirmar.
+			var writable = action === "create" ? !preview.exists : preview.exists;
+
+			// En update se muestra el diff propiedad por propiedad; en create, lo que se manda.
+			var body;
+			if (action === "update" && preview.changes) {
+				body = new Table({
+					noDataText: "Sin cambios: el formulario es idéntico a lo guardado.",
+					columns: [
+						new Column({ header: new Text({ text: "Propiedad" }), width: "15rem" }),
+						new Column({ header: new Text({ text: "Antes" }) }),
+						new Column({ header: new Text({ text: "Después" }) })
+					],
+					items: preview.changes.map(function (c) {
+						var st = c.after === "(SE PIERDE)" ? "Error" : c.after === "(SE QUITA)" ? "Warning" : "Success";
+						return new ColumnListItem({ cells: [
+							new Text({ text: c.property }),
+							new Text({ text: String(c.before) }),
+							new ObjectStatus({ text: String(c.after), state: st })
+						] });
+					})
+				});
+			} else {
+				body = propertyTable(preview.willSend || {});
+			}
+
+			var confirmBtn = new Button({ text: "Confirmar y escribir", type: "Emphasized", enabled: false, press: function () {
+				confirmBtn.setEnabled(false);
+				var req = action === "create"
+					? postJson("POST", base + "/__destinations", { config: config, confirm: typed.getValue() })
+					: postJson("PUT", base + "/__destinations/" + encodeURIComponent(name), { config: config, confirm: typed.getValue() });
+				req.then(function () {
+					MessageToast.show((action === "create" ? "Creada: " : "Actualizada: ") + name);
+					dlg.close();
+					onDone();
+				}).catch(function (e) {
+					error.setText(e.message).setVisible(true);
+					confirmBtn.setEnabled(true);
+				});
+			} });
+			// El boton se habilita unicamente cuando lo tipeado es exactamente el nombre.
+			typed.attachLiveChange(function (e) { confirmBtn.setEnabled(writable && e.getParameter("value") === name); });
+			typed.setVisible(writable);
+
+			// El aviso dice sin rodeos QUE se va a hacer y DONDE, antes del detalle.
+			var headline = action === "create"
+				? "ATENCIÓN: vas a CREAR la destination " + name
+				: "ATENCIÓN: vas a MODIFICAR la destination " + name;
+
+			var dlg = new Dialog({
+				title: (action === "create" ? "Crear " : "Actualizar ") + name,
+				state: writable ? "Warning" : "Error",
+				contentWidth: "46rem",
+				content: [ new VBox({ items: [
+					new MessageStrip({ type: writable ? "Warning" : "Error", showIcon: true,
+						text: headline + " en el subaccount " + model.getProperty("/target") + ". " + (action === "create" && writable ? "" : preview.warning) }).addStyleClass("sapUiSmallMarginBottom"),
+					body,
+					typed.addStyleClass("sapUiSmallMarginTop"),
+					error.addStyleClass("sapUiSmallMarginTop")
+				] }).addStyleClass("sapUiSmallMargin") ],
+				beginButton: confirmBtn,
+				endButton: new Button({ text: "Cancelar", press: function () { dlg.close(); } }),
+				afterClose: function () { dlg.destroy(); }
+			});
+			dlg.open();
+		}
+
+		// Paso 1: formulario. `name` null = crear una nueva.
+		function openEditor(name) {
+			var isNew = !name;
+			var error = new MessageStrip({ type: "Error", showIcon: true, visible: false });
+			var holder = new VBox();
+			var form = null;
+
+			function mount(current) {
+				form = buildForm(current, isNew);
+				holder.addItem(form.box);
+			}
+			if (isNew) {
+				mount({});
+			} else {
+				// Precarga con la definicion guardada, SIN los campos secretos: el
+				// merge del servidor los conserva si no se mandan.
+				fetch(base + "/__destinations/" + encodeURIComponent(name) + "/raw")
+					.then(function (r) { return r.json(); })
+					.then(function (def) {
+						if (def.error) { throw new Error(def.error); }
+						mount(def);
+					})
+					.catch(function (e) { error.setText(e.message).setVisible(true); });
+			}
+
+			var dlg = new Dialog({
+				title: isNew ? "Nueva destination" : "Editar " + name,
+				contentWidth: "46rem",
+				content: [ new VBox({ items: [
+					new MessageStrip({ type: "Warning", showIcon: true, text:
+						"Escribe en el subaccount del target actual de CF: " + model.getProperty("/target") + ". " +
+						"Nada se guarda hasta confirmar en el paso siguiente." +
+						(isNew ? "" : " Los secretos guardados no se muestran: dejar el campo vacío los conserva.")
+					}).addStyleClass("sapUiSmallMarginBottom"),
+					holder,
+					error.addStyleClass("sapUiSmallMarginTop")
+				] }).addStyleClass("sapUiSmallMargin") ],
+				beginButton: new Button({ text: "Revisar cambios", type: "Emphasized", press: function () {
+					if (!form) { return; }
+					var config;
+					try { config = form.getConfig(); }
+					catch (e) { error.setText(e.message).setVisible(true); return; }
+					if (!isNew) { config.Name = name; }
+					error.setVisible(false);
+					BusyIndicator.show(0);
+					postJson("POST", base + "/__destinations/preview", { action: isNew ? "create" : "update", config: config })
+						.then(function (pv) {
+							confirmWrite(isNew ? "create" : "update", config, pv, function () { dlg.close(); reload(); });
+						})
+						.catch(function (e) { error.setText(e.message).setVisible(true); })
+						.finally(function () { BusyIndicator.hide(); });
+				} }),
+				endButton: new Button({ text: "Cancelar", press: function () { dlg.close(); } }),
+				afterClose: function () { dlg.destroy(); }
+			});
+			dlg.open();
+		}
+
+		// ---------------------------------------------------------------
+		// Eliminar: un solo dialogo, con la definicion a la vista, el aviso de
+		// responsabilidad y el nombre tipeado. No hay papelera en BTP: el
+		// backup que devuelve el proxy (y que queda en su consola) es lo unico
+		// que permite recrearla. El guard de `confirm` sigue en el servidor.
+		// ---------------------------------------------------------------
+		function openDelete(name) {
+			var error = new MessageStrip({ type: "Error", showIcon: true, visible: false });
+			var typed = new Input({ width: "100%", placeholder: "Escribí el nombre exacto para confirmar: " + name });
+			var holder = new VBox();
+
+			fetch(base + "/__destinations/" + encodeURIComponent(name) + "/raw")
+				.then(function (r) { return r.json(); })
+				.then(function (def) {
+					if (def.error) { throw new Error(def.error); }
+					holder.addItem(propertyTable(def));
+				})
+				.catch(function (e) { error.setText(e.message).setVisible(true); });
+
+			var delBtn = new Button({ text: "Eliminar definitivamente", type: "Reject", enabled: false, press: function () {
+				delBtn.setEnabled(false);
+				postJson("DELETE", base + "/__destinations/" + encodeURIComponent(name), { confirm: typed.getValue() })
+					.then(function () {
+						MessageToast.show("Eliminada: " + name);
+						dlg.close();
+						reload();
+					})
+					.catch(function (e) {
+						error.setText(e.message).setVisible(true);
+						delBtn.setEnabled(true);
+					});
+			} });
+			typed.attachLiveChange(function (e) { delBtn.setEnabled(e.getParameter("value") === name); });
+
+			var dlg = new Dialog({
+				title: "Eliminar " + name,
+				state: "Error",
+				contentWidth: "46rem",
+				content: [ new VBox({ items: [
+					new MessageStrip({ type: "Error", showIcon: true, text:
+						"ATENCIÓN: vas a ELIMINAR la destination " + name + " del subaccount " + model.getProperty("/target") + ". " +
+						"No hay papelera ni deshacer: lo hacés BAJO TU PROPIA RESPONSABILIDAD. " +
+						"Cualquier app, iFlow o job que la use va a dejar de funcionar. " +
+						"Anotá la definición de abajo si querés poder recrearla (los secretos no se muestran)."
+					}).addStyleClass("sapUiSmallMarginBottom"),
+					holder,
+					typed.addStyleClass("sapUiSmallMarginTop"),
+					error.addStyleClass("sapUiSmallMarginTop")
+				] }).addStyleClass("sapUiSmallMargin") ],
+				beginButton: delBtn,
+				endButton: new Button({ text: "Cancelar", press: function () { dlg.close(); } }),
+				afterClose: function () { dlg.destroy(); }
+			});
+			dlg.open();
+		}
+
+		// ---------------------------------------------------------------
+		// Cabecera: los tres URLs y el boton de estado
+		// ---------------------------------------------------------------
+		var healthStrip = new MessageStrip({
+			visible: "{= !!${/health}}",
+			type: "{/healthType}",
+			showIcon: true,
+			text: "{/healthText}"
+		});
+
+		function urlRow(label, url, link) {
+			return new HBox({ alignItems: "Center", items: [
+				new Label({ text: label, width: "6rem" }),
+				link
+					? new Link({ text: url, href: url, target: "_blank" }).addStyleClass("cfp-url")
+					: new Text({ text: url }).addStyleClass("cfp-url")
+			] });
+		}
+
+		var header = new Panel({
+			headerText: "cf-proxy",
+			expandable: false,
+			content: [
+				new VBox({ items: [
+					urlRow("Uso:", base + "/<NOMBRE_DESTINATION>/<path>", false),
+					urlRow("Listado:", base + "/__destinations", true),
+					urlRow("Detalle:", base + "/__destination/<NOMBRE>", false),
+					urlRow("Estado:", base + "/__health", true),
+					urlRow("Login:", base + "/__login", true),
+					new HBox({ alignItems: "Center", items: [
+						new Label({ text: "Target CF:", width: "6rem" }),
+						new ObjectStatus({ text: "{/target}", state: "Information", inverted: true })
+					] }).addStyleClass("sapUiTinyMarginTop"),
+					new HBox({ items: [
+						new Button({ text: "Chequear estado", icon: "sap-icon://refresh", type: "Emphasized", press: reload }),
+						// Login/logout son redirects del proxy: se navega, no se hace fetch.
+						new Button({ text: "Iniciar sesión", icon: "sap-icon://log", visible: "{/canLogin}", press: function () { location.href = base + "/__login"; } }).addStyleClass("sapUiTinyMarginBegin"),
+						new Button({ text: "Cerrar sesión", icon: "sap-icon://visits", visible: "{/canLogout}", press: function () { location.href = base + "/__logout"; } }).addStyleClass("sapUiTinyMarginBegin")
+					] }).addStyleClass("sapUiSmallMarginTop"),
+					healthStrip.addStyleClass("sapUiSmallMarginTop")
+				] }).addStyleClass("sapUiSmallMargin")
+			]
+		});
+
+		// ---------------------------------------------------------------
+		// Tabla de destinations con buscador
+		// ---------------------------------------------------------------
+		var table = new Table({
+			growing: true,
+			growingThreshold: 50,
+			sticky: ["ColumnHeaders", "HeaderToolbar"],
+			headerToolbar: new Toolbar({ content: [
+				new Title({ text: "Destinations ({/count})" }),
+				new ToolbarSpacer(),
+				new Button({ text: "Nueva destination", icon: "sap-icon://add", press: function () { openEditor(null); } }),
+				new SearchField({ width: "22rem", placeholder: "Filtrar por nombre, auth, URL…", liveChange: function (e) {
+					var q = e.getParameter("newValue");
+					var f = q ? new Filter({ filters: [
+						new Filter("name", FilterOperator.Contains, q),
+						new Filter("auth", FilterOperator.Contains, q),
+						new Filter("url", FilterOperator.Contains, q),
+						new Filter("proxyType", FilterOperator.Contains, q)
+					], and: false }) : null;
+					table.getBinding("items").filter(f);
+				} })
+			] }),
+			columns: [
+				new Column({ header: new Text({ text: "Nombre" }) }),
+				new Column({ header: new Text({ text: "Authentication" }), minScreenWidth: "Tablet", demandPopin: true }),
+				new Column({ header: new Text({ text: "Proxy" }), width: "7rem", minScreenWidth: "Tablet", demandPopin: true }),
+				new Column({ header: new Text({ text: "URL backend" }), minScreenWidth: "Desktop", demandPopin: true }),
+				new Column({ header: new Text({ text: "Estado" }), width: "14rem" }),
+				new Column({ width: "20rem", hAlign: "End" })
+			],
+			items: {
+				path: "/destinations",
+				template: new ColumnListItem({ cells: [
+					new Link({ text: "{name}", href: "{proxyUrl}", target: "_blank", wrapping: true }),
+					new Text({ text: "{auth}" }),
+					new Text({ text: "{proxyType}" }),
+					new Text({ text: "{url}", maxLines: 1 }),
+					new ObjectStatus({ text: "{stateText}", state: "{state}" }),
+					new HBox({ justifyContent: "End", items: [
+						new Button({ text: "Detalles", icon: "sap-icon://detail-view", press: function (e) {
+							showDetail(e.getSource().getBindingContext().getProperty("name"));
+						} }),
+						new Button({ text: "Editar", icon: "sap-icon://edit", press: function (e) {
+							openEditor(e.getSource().getBindingContext().getProperty("name"));
+						} }).addStyleClass("sapUiTinyMarginBegin"),
+						new Button({ text: "Eliminar", icon: "sap-icon://delete", type: "Reject", press: function (e) {
+							openDelete(e.getSource().getBindingContext().getProperty("name"));
+						} }).addStyleClass("sapUiTinyMarginBegin")
+					] })
+				] })
+			}
+		});
+
+		new Page({
+			showHeader: false,
+			content: [header, table]
+		}).setModel(model).placeAt("content");
+
+		reload();
+	});
+});
+</script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+{
+  "name": "cf-dest-app",
+  "version": "1.0.0",
+  "private": true,
+  "description": "App minima desplegada por mta.yaml. Solo se queda viva para que cf-proxy pueda abrir un port-forward SSH a traves de ella.",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}
