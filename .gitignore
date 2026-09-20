@@ -1,0 +1,8 @@
+node_modules/
+cf-dest-app/node_modules/
+*.env
+
+# El .mtar SI se versiona: es lo que el launcher distribuye para que la PC
+# destino no necesite mbt. Lo que se ignora es el resto del build de mbt.
+mta_archives/*
+!mta_archives/*.mtar

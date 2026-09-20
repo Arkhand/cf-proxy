@@ -1,6 +1,6 @@
 # cf-proxy launcher
 
-Ventana para arrancar [cf-proxy](../cf-proxy/) sin tocar la terminal, y
+Ventana para arrancar [cf-proxy](../) sin tocar la terminal, y
 paquete listo para pasarle a un colega.
 
 **No reemplaza nada del proxy.** Junta credenciales, org/space y opciones, y
@@ -55,9 +55,10 @@ python -m cfproxy_launcher     # correr desde el código
 python build.py                # armar dist/cf-proxy-launcher/
 ```
 
-`build.py` corre PyInstaller, copia el proyecto Node (solo lo que hace falta
-en runtime: sin `node_modules`, `.env` ni `mta_archives`) y agrega el `.mtar`
-de `cf-proxy/mta_archives/`; si no existe, corre `mbt build`.
+`build.py` corre PyInstaller, copia el proyecto Node desde la raíz del repo
+(solo lo que hace falta en runtime: sin `node_modules`, `.env` ni
+`mta_archives`) y agrega el `.mtar` de `mta_archives/`; si no existe, corre
+`mbt build`.
 
 Para buildear hace falta `pyinstaller`. Para usarlo, no.
 

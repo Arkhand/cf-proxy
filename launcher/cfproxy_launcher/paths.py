@@ -11,8 +11,7 @@ El paquete distribuible se ve asi:
 
 Y en desarrollo, el repo:
 
-    BAS-PROXY/
-      cf-proxy/             <- el proyecto
+    CF-proxy/               <- el proyecto (server.js en la raiz)
       launcher/             <- este codigo
 
 Se buscan las dos formas para que `python -m cfproxy_launcher` y el .exe se
@@ -23,23 +22,21 @@ from pathlib import Path
 
 
 def base_dir() -> Path:
-    """Carpeta del ejecutable (o del repo, en desarrollo)."""
+    """Carpeta del ejecutable (o la raiz del repo, en desarrollo)."""
     if getattr(sys, "frozen", False):
         return Path(sys.executable).parent
+    # cfproxy_launcher/ -> launcher/ -> raiz del repo
     return Path(__file__).resolve().parents[2]
 
 
-def _candidates(*parts) -> list:
-    base = base_dir()
-    return [
-        base / "recursos" / Path(*parts),   # paquete distribuido
-        base / Path(*parts),                # repo en desarrollo
-    ]
-
-
 def find_proxy_dir():
-    """Carpeta de cf-proxy: la que tiene server.js. None si no esta."""
-    for path in _candidates("cf-proxy"):
+    """
+    Carpeta del proyecto Node: la que tiene server.js.
+
+    Empaquetado esta en recursos/cf-proxy/; en desarrollo es la raiz del repo.
+    """
+    base = base_dir()
+    for path in (base / "recursos" / "cf-proxy", base):
         if (path / "server.js").is_file():
             return path
     return None
@@ -47,7 +44,7 @@ def find_proxy_dir():
 
 def find_mtar():
     """El .mtar pre-buildeado para desplegar los recursos. None si no esta."""
-    for folder in [base_dir() / "recursos", base_dir(), base_dir() / "cf-proxy" / "mta_archives"]:
+    for folder in [base_dir() / "recursos", base_dir(), base_dir() / "mta_archives"]:
         if folder.is_dir():
             found = sorted(folder.glob("*.mtar"))
             if found:

@@ -1,6 +1,0 @@
-node_modules/
-# Salida de mbt build
-mta_archives/
-*.mtar
-cf-dest-app/node_modules/
-*.env

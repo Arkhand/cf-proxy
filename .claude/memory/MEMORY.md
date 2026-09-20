@@ -1,0 +1,4 @@
+- [Estilo de codigo: pasos separados y comentados, nada hardcodeado](code-style-steps.md) — modulos por paso, comentarios que explican el por que, y descubrimiento en runtime en vez de nombres fijos
+- [Nombres de recursos CF: cf-dest-*, sin proxy/tunnel](naming-cf-resources.md) — nombres neutros para el space compartido; mta.yaml en la raiz
+- [Estado del proyecto, trial de prueba y hallazgos del Destination Service](estado-y-trial.md) — que esta hecho, la trial donde se prueba escritura, y lo que el servicio real hace distinto de lo documentado
+- [Verificar el target de CF antes de escribir](verificar-target.md) — el incidente de BMS: un deploy al cliente equivocado dejo un destino huerfano que sobrevivio al undeploy

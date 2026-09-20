@@ -21,8 +21,8 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-REPO = ROOT.parent
-PROXY = REPO / "cf-proxy"
+# El proyecto Node es la raiz del repo; el launcher vive en launcher/.
+PROXY = ROOT.parent
 DIST = ROOT / "dist" / "cf-proxy-launcher"
 
 # Lo que el proxy necesita en runtime. Se listan a mano para no arrastrar
