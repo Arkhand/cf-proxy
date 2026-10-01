@@ -102,10 +102,15 @@ space. Lo único que no va a funcionar sin el deploy es PrincipalPropagation.
   **puerto tampoco**. Un perfil que choca (p.ej. importado del launcher viejo,
   todos en 3100) queda marcado y no arranca hasta corregirlo:
   `profiles edit <p> --port auto`.
-- **Cada perfil tiene su CF_HOME** (`~/.cf-proxy/profiles/<p>/cf-home`). El
-  proxy nunca usa ni cambia la sesión global de `cf`: tu terminal sigue
-  apuntando donde estaba, y dos clientes pueden correr a la vez. Los plugins
-  (`multiapps`) se siguen leyendo de `~/.cf` vía `CF_PLUGIN_HOME`.
+- **La sesión de `cf` es del usuario en esa región** (`~/.cf-target/sessions/…`),
+  compartida con [cf-target](../cf-target): un login sirve para el proxy y para
+  los deploys. Cada corrida (y cada proxy) usa una **copia privada** y pone ahí
+  su propio org/space; solo vuelven los tokens renovados. El proxy nunca usa ni
+  cambia la sesión global de `cf`: tu terminal sigue apuntando donde estaba, y
+  dos clientes pueden correr a la vez. Los plugins (`multiapps`) se siguen
+  leyendo de `~/.cf` vía `CF_PLUGIN_HOME`.
+- **Perfil desde un proyecto:** `profiles add --from-target [--dir <carpeta>]`
+  toma api/org/space/usuario del `.cf-target` del proyecto.
 - **Una corrida por perfil.** `start` de un perfil que ya corre devuelve su URL
   (`already: true`) en vez de levantar otro. Sirve para que dos sesiones de IA
   pidan el mismo cliente sin pisarse. Dos `start` simultáneos terminan en un
@@ -116,7 +121,8 @@ space. Lo único que no va a funcionar sin el deploy es PrincipalPropagation.
   acá.
 - `--json` en cualquier comando imprime un solo objeto (`{ok, ...}`); es lo que
   usan el launcher y las skills. Códigos de salida: 2 uso, 3 ya corre, 4 sin
-  sesión, 5 puerto ocupado, 6 faltan recursos en el space.
+  sesión, 5 puerto ocupado, 6 faltan recursos en el space, 7 la sesión o el
+  `.cf-target` de la carpeta son de otra cuenta.
 
 En el `ui5.yaml` del proyecto:
 

@@ -35,6 +35,27 @@ const { spawn } = require("child_process");
 const cf = require("../lib/cf");
 const profiles = require("../lib/profiles");
 const runs = require("../lib/runs");
+const sessions = require("../lib/sessions");
+const targetfile = require("../lib/targetfile");
+
+/**
+ * cf de este comando en una copia privada de la sesion del perfil. Al salir
+ * (process.exit incluido) devuelve los tokens renovados; replace (login) pisa
+ * la sesion compartida entera, solo si el comando termino bien.
+ */
+function useSession(p, { replace = false } = {}) {
+	const run = sessions.openRun(profiles.sessionHomeOf(p));
+	cf.configure({ cfHome: run.home });
+	process.on("exit", (code) => {
+		try {
+			// Un login que fallo (o que dejo otro usuario) no llega a la sesion compartida.
+			if (!(replace && code !== 0)) sessions.writeBack(run, { replace });
+		} finally {
+			sessions.closeRun(run);
+		}
+	});
+	return run;
+}
 
 const SERVER = process.env.CF_PROXY_SERVER || path.join(__dirname, "..", "server.js");
 const { EXIT } = runs;
@@ -155,6 +176,15 @@ async function cmdProfiles() {
 				}
 			});
 		}
+		if (sub === "add" && flags["from-target"]) {
+			const dir = typeof flags.dir === "string" ? flags.dir : process.cwd();
+			const loaded = targetfile.loadTarget(dir);
+			if (!loaded) die(EXIT.USAGE, `No hay .cf-target en ${dir} ni arriba.`);
+			const t = loaded.target;
+			const name = typeof flags.name === "string" ? flags.name : t.org.replace(/[^A-Za-z0-9._-]+/g, "-").replace(/^-+|-+$/g, "").slice(0, 30);
+			const p = profiles.add({ name, title: typeof flags.title === "string" ? flags.title : t.org, api: t.api, user: t.user, auth: t.auth, org: t.org, space: t.space, port: flags.port ?? "auto" });
+			return done({ profile: p }, () => console.log(`Perfil ${p.name} creado desde ${loaded.file} (puerto ${p.port}).`));
+		}
 		if (sub === "add") {
 			const p = profiles.add(profileFields());
 			return done({ profile: p }, () => console.log(`Perfil ${p.name} creado en el puerto ${p.port}. Siguiente: cf-proxy login ${p.name}`));
@@ -190,7 +220,7 @@ async function cmdProfiles() {
 // ============================================================================
 async function cmdLogin() {
 	const p = requireProfile(positional[1], false);
-	cf.configure({ cfHome: profiles.cfHomeOf(p.name) });
+	useSession(p, { replace: true });
 	const withTarget = p.org && p.space ? { org: p.org, space: p.space } : {};
 	let failure = null;
 
@@ -216,6 +246,9 @@ async function cmdLogin() {
 	// org, o en ninguno si el del perfil no existe para este usuario.
 	const session = await cf.checkLogin();
 	if (!session.ok) die(EXIT.NO_SESSION, failure || "El login no dejo sesion.");
+	if (p.user && String(session.user).toLowerCase() !== p.user.toLowerCase()) {
+		die(EXIT.MISMATCH, `El login quedo como ${session.user}, pero el perfil ${p.name} es de ${p.user}. No se guardo.`);
+	}
 
 	// La sesion sirve igual: con ella se listan los orgs reales (`targets`) para
 	// corregir el perfil. El arranque igual se niega si el org no existe.
@@ -231,7 +264,7 @@ async function cmdLogin() {
 
 async function cmdTargets() {
 	const p = requireProfile(positional[1], false);
-	cf.configure({ cfHome: profiles.cfHomeOf(p.name) });
+	useSession(p);
 	const session = await cf.checkLogin();
 	if (!session.ok) die(EXIT.NO_SESSION, `El perfil ${p.name} no tiene sesion.`, { hint: `cf-proxy login ${p.name}` });
 	const targets = await cf.listTargets();
@@ -430,7 +463,29 @@ const NO_SESSION_OK = ["login", "logout", "api", "auth", "version", "--version",
 async function cmdCf() {
 	const p = requireProfile(positional[1], false);
 	if (!rest.length) die(EXIT.USAGE, "Falta el comando de cf despues de `--`.", { hint: `Ej.: cf-proxy cf ${p.name} -- target` });
-	cf.configure({ cfHome: profiles.cfHomeOf(p.name) });
+
+	// Un proyecto con .cf-target declara su cuenta: este wrapper no puede servir para salir de ella.
+	let declared = null;
+	try {
+		declared = targetfile.loadTarget(process.cwd());
+	} catch (e) {
+		// .cf-target invalido: lo reporta cf-target, no este wrapper.
+	}
+	if (declared) {
+		const t = declared.target;
+		const same = profiles.normalizeApi(t.api) === profiles.normalizeApi(p.api) && t.org === p.org &&
+			String(t.user).toLowerCase() === String(p.user).toLowerCase();
+		if (!same) {
+			die(EXIT.MISMATCH, `Este proyecto declara ${t.api} / ${t.org} como ${t.user} (${declared.file}); el perfil ${p.name} es otra cuenta.`,
+				{ hint: "En este proyecto: cf-target -- <args>" });
+		}
+	}
+
+	// La sesion es del usuario y la comparten cf-target y otros perfiles: no se cambia desde aca.
+	if (["login", "auth", "api", "logout"].includes(String(rest[0]).toLowerCase())) {
+		die(EXIT.USAGE, `\`cf ${rest[0]}\` por el wrapper cambiaria la sesion compartida.`, { hint: `Usar: cf-proxy login ${p.name}` });
+	}
+	useSession(p);
 
 	// Nunca salir del org del perfil: es lo que evita repetir el incidente de BMS.
 	const oi = rest.findIndex((a) => a === "-o");
@@ -442,10 +497,14 @@ async function cmdCf() {
 	if (!NO_SESSION_OK.includes(rest[0])) {
 		const session = await cf.checkLogin();
 		if (!session.ok) die(EXIT.NO_SESSION, `El perfil ${p.name} no tiene sesion.`, { hint: `cf-proxy login ${p.name}` });
-		if (session.org !== p.org) {
-			die(EXIT.USAGE, `La sesion del perfil apunta a ${session.org || "ningun org"}, no a ${p.org}.`, { hint: `cf-proxy login ${p.name}` });
+		if (p.user && String(session.user).toLowerCase() !== p.user.toLowerCase()) {
+			die(EXIT.MISMATCH, `La sesion es de ${session.user}, el perfil ${p.name} es de ${p.user}.`, { hint: `cf-proxy login ${p.name}` });
 		}
-		where = `${session.api} / ${session.org} / ${session.space}`;
+		// La copia es de esta corrida: el org/space del perfil se pone aca, no se
+		// hereda del ultimo login (que pudo ser de otro org del mismo usuario).
+		const targeted = await cf.setTarget(p.org, p.space);
+		if (!targeted.ok) die(EXIT.ERROR, `No se pudo apuntar a ${p.org} / ${p.space}: ${targeted.error}`);
+		where = `${session.api} / ${p.org} / ${p.space}`;
 	}
 
 	// A stderr, para no ensuciar la salida de `cf` si se la redirige.

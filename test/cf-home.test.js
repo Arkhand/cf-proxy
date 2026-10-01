@@ -26,6 +26,7 @@ process.env.CF_PROXY_HOME = path.join(tmp, "home");
 process.env.CF_PROXY_LAUNCHER_DIR = path.join(tmp, "sin-launcher");
 process.env.CF_PROXY_CF_BIN = path.join(__dirname, "fake-cf.js");
 process.env.FAKE_CF_LOG = fakeLog;
+process.env.CF_TARGET_HOME = path.join(tmp, "sessions");
 
 const calls = () => (fs.existsSync(fakeLog) ? fs.readFileSync(fakeLog, "utf8").trim().split("\n").filter(Boolean).map(JSON.parse) : []);
 const node = (script, args, input) => spawnSync(process.execPath, [script, ...args], { cwd: root, env: process.env, input, encoding: "utf8" });
@@ -41,7 +42,9 @@ profiles.add({ name: "acme", title: "ACME", api: "https://api.cf.eu10.hana.ondem
 	const unconfigured = await cf.checkLogin();
 	ok("sin configure, cf no se ejecuta", !unconfigured.ok && calls().length === 0);
 
-	const acmeHome = profiles.cfHomeOf("acme");
+	const sessions = require("../lib/sessions");
+	const acmeRun = sessions.openRun(profiles.sessionHomeOf(profiles.get("acme")));
+	const acmeHome = acmeRun.home;
 	cf.configure({ cfHome: acmeHome });
 	await cf.checkLogin();
 	const all = calls();
@@ -75,6 +78,30 @@ profiles.add({ name: "acme", title: "ACME", api: "https://api.cf.eu10.hana.ondem
 	ok("y avisa que el org del perfil no existe", /org-inexistente/.test(json(wrong).warning || ""));
 	ok("targets anda despues de ese login", cli(["targets", "wrongorg", "--json"]).status === 0);
 
+	// --- perfil desde un .cf-target --------------------------------------------
+	const proj = path.join(tmp, "proj");
+	fs.mkdirSync(proj);
+	fs.writeFileSync(path.join(proj, ".cf-target"), "api = https://api.cf.ap10.hana.ondemand.com\norg = beta-org\nspace = dev\nuser = b@beta.com\nauth = sso\n");
+	const fromTarget = cli(["profiles", "add", "--from-target", "--dir", proj, "--title", "Beta", "--json"]);
+	ok("profiles add --from-target crea el perfil", fromTarget.status === 0 && json(fromTarget).profile.org === "beta-org" && json(fromTarget).profile.title === "Beta");
+
+	// --- review: la sesion es del usuario, el org lo pone cada corrida ---------
+	profiles.add({ name: "acme2", title: "ACME 2", api: "https://api.cf.eu10.hana.ondemand.com", user: "dev@acme", auth: "password", org: "acme-org-2", space: "dev", port: 4713 });
+	cli(["login", "acme2", "--password-stdin", "--json"], "good\n");
+	const afterOther = cli(["cf", "acme", "--", "services"]);
+	ok("el wrapper usa el org del perfil aunque el ultimo login fuera de otro org", afterOther.status === 0 && /acme-org \/ dev/.test(afterOther.stderr));
+
+	const inProject = spawnSync(process.execPath, [path.join(root, "bin", "cf-proxy.js"), "cf", "acme", "--", "services"], { cwd: proj, env: process.env, encoding: "utf8" });
+	ok("desde un proyecto con otro .cf-target, el wrapper se niega (7)", inProject.status === 7 && /cf-target/.test(inProject.stderr));
+
+	const sneakyAuth = cli(["cf", "acme", "--", "auth", "otro@x", "pw"]);
+	ok("el wrapper no deja loguear otro usuario en la sesion compartida", sneakyAuth.status === 2 && /cf-proxy login/.test(sneakyAuth.stderr));
+
+	profiles.add({ name: "ssoprof", title: "SSO", api: "https://api.cf.eu20.hana.ondemand.com", user: "someone@x.com", auth: "sso", org: "sso-org", space: "dev", port: 4714 });
+	const wrongUser = cli(["login", "ssoprof", "--sso-passcode", "good", "--json"]);
+	ok("login que deja otro usuario que el del perfil -> 7", wrongUser.status === 7);
+	ok("y no pisa la sesion compartida de ese usuario", !fs.existsSync(path.join(profiles.sessionHomeOf(profiles.get("ssoprof")), ".cf", "config.json")));
+
 	// --- wrapper cf ------------------------------------------------------------
 	const other = cli(["cf", "acme", "--", "target", "-o", "otro-cliente"]);
 	ok("el wrapper rechaza apuntar a otro org", other.status === 2 && /no se puede apuntar a otro-cliente/.test(other.stderr));
@@ -83,7 +110,8 @@ profiles.add({ name: "acme", title: "ACME", api: "https://api.cf.eu10.hana.ondem
 	ok("el wrapper corre cf con banner del perfil", passthrough.status === 0 && /\[cf-proxy\] perfil acme -> .*acme-org \/ dev/.test(passthrough.stderr));
 	ok("y la salida de cf llega intacta", /fake cf: services/.test(passthrough.stdout));
 
-	ok("ningun cf corrio sin CF_HOME de perfil", calls().every((c) => c.CF_HOME && c.CF_HOME.startsWith(process.env.CF_PROXY_HOME)));
+	ok("todo cf corrio en una copia privada de la sesion", calls().every((c) => c.CF_HOME && path.basename(c.CF_HOME).startsWith("cf-target-")));
+	ok("el login quedo en la sesion compartida", fs.existsSync(path.join(profiles.sessionHomeOf(profiles.get("acme")), ".cf", "config.json")));
 
 	// --- perfil con problemas no arranca ---------------------------------------
 	fs.writeFileSync(path.join(process.env.CF_PROXY_HOME, "profiles.json"), JSON.stringify({

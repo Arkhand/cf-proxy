@@ -171,9 +171,9 @@ node bin\cf-proxy.js cf acme -- services       :: cualquier comando de cf, con l
 - **Una subcuenta, un perfil.** No se pueden crear dos perfiles para el mismo
   org en la misma región, ni dos con el mismo puerto. El proxy de un perfil no
   puede cambiar de org (sí de space, desde su página).
-- **Contraseñas:** se guardan cifradas con tu cuenta de Windows (DPAPI). El
-  archivo no sirve en otra PC ni para otro usuario. Nunca van en texto plano
-  ni en la línea de comandos.
+- **Contraseñas:** se guardan en el Administrador de credenciales de Windows
+  (entrada `cf-target:<api>:<usuario>`), donde las podés ver y borrar. Nunca
+  van en texto plano ni en la línea de comandos.
 - **Solo para desarrollo.** No interviene en cómo se despliegan las apps.
 
 ## 9. Dónde se guarda todo
@@ -181,12 +181,13 @@ node bin\cf-proxy.js cf acme -- services       :: cualquier comando de cf, con l
 | Ruta | Qué tiene |
 |---|---|
 | `%USERPROFILE%\.cf-proxy\profiles.json` | Los perfiles (sin secretos) |
-| `%USERPROFILE%\.cf-proxy\profiles\<perfil>\` | La sesión de `cf` de cada perfil |
+| `%USERPROFILE%\.cf-target\sessions\` | La sesión de `cf` de cada usuario y región (compartida con cf-target) |
 | `%USERPROFILE%\.cf-proxy\runs\` | Proxies corriendo (`.json`) y su salida (`.log`) |
 | `%USERPROFILE%\.cf-proxy\user-token-*.json` | Sesiones de login de usuario |
-| `%APPDATA%\cf-proxy-launcher\secrets.bin` | Contraseñas (DPAPI) |
+| Administrador de credenciales de Windows | Contraseñas (`cf-target:<api>:<usuario>`) |
 
-Para empezar de cero, cerrá todo y borrá esas carpetas.
+Para empezar de cero, cerrá todo, borrá esas carpetas y las entradas `cf-target:` del
+Administrador de credenciales.
 
 ## 10. Problemas frecuentes
 

@@ -2,16 +2,17 @@
  * `cf` FALSO para los tests. Se activa con CF_PROXY_CF_BIN=test/fake-cf.js.
  *
  * Anota cada invocacion (argumentos y CF_HOME/CF_PLUGIN_HOME) en el archivo
- * FAKE_CF_LOG, y guarda su "sesion" en $CF_HOME/fake-session.json: asi cada
- * perfil tiene la suya, igual que con el `cf` real. Responde lo justo para
- * login, target y las consultas de orgs/spaces.
+ * FAKE_CF_LOG, y guarda su "sesion" en $CF_HOME/.cf/config.json, donde la guarda el
+ * cf real: asi las copias por corrida de lib/sessions.js la llevan y la traen igual
+ * que con el `cf` real. Responde lo justo para login, target y las consultas de
+ * orgs/spaces.
  */
 const fs = require("fs");
 const path = require("path");
 
 const args = process.argv.slice(2);
 const home = process.env.CF_HOME || "";
-const sessionFile = path.join(home, "fake-session.json");
+const sessionFile = path.join(home, ".cf", "config.json");
 
 if (process.env.FAKE_CF_LOG) {
 	fs.appendFileSync(process.env.FAKE_CF_LOG, JSON.stringify({
@@ -21,7 +22,7 @@ if (process.env.FAKE_CF_LOG) {
 
 let s = {};
 try { s = JSON.parse(fs.readFileSync(sessionFile, "utf8")); } catch (e) { /* sin sesion */ }
-const save = () => fs.writeFileSync(sessionFile, JSON.stringify(s));
+const save = () => { fs.mkdirSync(path.dirname(sessionFile), { recursive: true }); fs.writeFileSync(sessionFile, JSON.stringify(s)); };
 const flag = (f) => (args.indexOf(f) !== -1 ? args[args.indexOf(f) + 1] : undefined);
 const out = (text, code = 0) => { process.stdout.write(text + "\n"); process.exit(code); };
 

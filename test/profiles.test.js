@@ -28,6 +28,7 @@ function throws(name, fn, re) {
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cfp-profiles-"));
 process.env.CF_PROXY_HOME = path.join(tmp, "home");
 process.env.CF_PROXY_LAUNCHER_DIR = path.join(tmp, "launcher");
+process.env.CF_TARGET_HOME = path.join(tmp, "sessions");
 
 // Igual que los perfiles reales del launcher: todos en 3100, mismo org en distintas apis.
 fs.mkdirSync(process.env.CF_PROXY_LAUNCHER_DIR, { recursive: true });
@@ -76,10 +77,19 @@ ok("pero queda con problems (no arranca)", profiles.get("Draft").problems.some((
 profiles.remove("Draft");
 
 // --- Baja ------------------------------------------------------------------
-fs.mkdirSync(profiles.cfHomeOf("New"), { recursive: true });
+const newHome = profiles.sessionHomeOf(profiles.get("New"));
+fs.mkdirSync(newHome, { recursive: true });
 profiles.remove("New");
 ok("remove saca el perfil", profiles.get("New") === null);
-ok("remove borra su CF_HOME", !fs.existsSync(path.dirname(profiles.cfHomeOf("New"))));
+ok("remove NO borra la sesion (la comparten cf-target y otros perfiles)", fs.existsSync(newHome));
+
+// Migracion: la sesion vieja del perfil pasa al store compartido.
+const oldCfg = path.join(process.env.CF_PROXY_HOME, "profiles", "Client", "cf-home", ".cf", "config.json");
+fs.mkdirSync(path.dirname(oldCfg), { recursive: true });
+fs.writeFileSync(oldCfg, JSON.stringify({ AccessToken: "old" }));
+ok("migrateSessions copia la sesion vieja", profiles.migrateSessions() === 1 &&
+	JSON.parse(fs.readFileSync(path.join(profiles.sessionHomeOf(profiles.get("Client")), ".cf", "config.json"), "utf8")).AccessToken === "old");
+ok("migrateSessions es idempotente", profiles.migrateSessions() === 0);
 
 // --- Escritura atomica: no quedan temporales --------------------------------
 ok("no queda profiles.json.tmp", !fs.existsSync(path.join(process.env.CF_PROXY_HOME, "profiles.json.tmp")));

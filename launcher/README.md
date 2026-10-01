@@ -52,17 +52,19 @@ perfiles, arranque, login de usuario, consola y problemas frecuentes.
 | Dónde | Qué tiene |
 |---|---|
 | `~/.cf-proxy/profiles.json` | Perfiles: endpoint, usuario, org/space, puerto, flags. **Sin secretos.** Compartidos con la consola. |
-| `~/.cf-proxy/profiles/<p>/cf-home` | La sesión de `cf` de cada perfil. |
+| `~/.cf-target/sessions/` | La sesión de `cf` de cada usuario y región, compartida con cf-target. Cada corrida usa una copia. |
 | `~/.cf-proxy/runs/` | Proxies corriendo (`<p>.json`) y su salida (`<p>.log`). |
-| `%APPDATA%\cf-proxy-launcher\secrets.bin` | Contraseñas por perfil, cifradas con **DPAPI** (la cuenta de Windows). |
+| Administrador de credenciales de Windows | Contraseñas, entrada `cf-target:<api>:<usuario>` (la misma que usa cf-target). |
 
 La primera vez que corre, la consola importa los perfiles del launcher viejo
 (`%APPDATA%\cf-proxy-launcher\profiles.json`). Los que choquen en puerto
 quedan marcados hasta corregirlos.
 
-La contraseña nunca se escribe en texto plano y el archivo cifrado **no sirve
-en otra PC ni para otro usuario**: DPAPI ata la clave a la cuenta de Windows.
-Se usa vía `ctypes`, sin dependencias externas.
+La contraseña nunca se escribe en texto plano ni en una línea de comandos: va al
+Administrador de credenciales de Windows (Panel de control > Administrador de
+credenciales > Credenciales de Windows), donde se ve y se borra. Se usa vía
+`ctypes`, sin dependencias externas. Las contraseñas del `secrets.bin` viejo
+(DPAPI) se migran solas la primera vez que se abre la ventana.
 
 ## Desarrollo
 
@@ -82,7 +84,7 @@ Para buildear hace falta `pyinstaller`. Para usarlo, no.
 
 | Archivo | Responsabilidad |
 |---|---|
-| `store.py` | Contraseñas por perfil (DPAPI) |
+| `store.py` | Contraseñas por usuario y región (Administrador de credenciales de Windows) |
 | `cf.py` | Requisitos: `cf` y `node` instalados |
 | `cli.py` | Todo lo demás: llama a `node bin/cf-proxy.js ... --json` |
 | `paths.py` | Dónde está cada cosa, empaquetado o en el repo |

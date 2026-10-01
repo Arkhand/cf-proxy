@@ -95,8 +95,12 @@ if (PROFILE.problems.length) {
 		`Corregirlo con: ${CLI_HINT} profiles edit ${PROFILE_NAME} ...`, runs.EXIT.USAGE);
 }
 
-// Desde aca, todo `cf` corre en el CF_HOME del perfil.
-cf.configure({ cfHome: profiles.cfHomeOf(PROFILE.name) });
+// Desde aca, todo `cf` corre en una copia privada de la sesion del perfil: el
+// target que ponga este proxy no le llega a nadie mas (ni a otro proxy ni a un
+// deploy de cf-target). Al salir vuelven solo los tokens renovados.
+const sessions = require("./lib/sessions");
+const sessionRun = sessions.openRun(profiles.sessionHomeOf(PROFILE));
+cf.configure({ cfHome: sessionRun.home });
 
 const PORT = PROFILE.port;
 const ALLOW_CREATE = has("--create-keys") || PROFILE.flags.create_keys;
@@ -145,6 +149,12 @@ process.on("exit", () => {
 	closeTunnel();
 	// Soltar el lock: el perfil queda libre para otro arranque.
 	if (run) run.release();
+	// Despues del tunel: el `cf ssh` usaba esta copia.
+	try {
+		sessions.writeBack(sessionRun);
+	} finally {
+		sessions.closeRun(sessionRun);
+	}
 });
 
 /** Un puerto local libre, elegido por el sistema. Para el tunel: dos proxies no pueden compartirlo. */
@@ -360,6 +370,10 @@ async function main() {
 	if (profiles.normalizeApi(session.api) !== profiles.normalizeApi(PROFILE.api)) {
 		fail(`La sesion del perfil es de ${session.api}, pero el perfil dice ${PROFILE.api}.`,
 			`Volver a loguearse con: ${CLI_HINT} login ${PROFILE.name}`, runs.EXIT.NO_SESSION);
+	}
+	if (PROFILE.user && String(session.user).toLowerCase() !== PROFILE.user.toLowerCase()) {
+		fail(`La sesion es de ${session.user}, pero el perfil es de ${PROFILE.user}.`,
+			`Volver a loguearse con: ${CLI_HINT} login ${PROFILE.name}`, runs.EXIT.MISMATCH);
 	}
 
 	// Siempre se apunta al org/space del perfil. Es seguro: el CF_HOME es solo

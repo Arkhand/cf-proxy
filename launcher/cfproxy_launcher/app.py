@@ -187,6 +187,9 @@ class LauncherApp(tk.Tk):
         self._background(work)
 
     def _fill_profiles(self, profiles):
+        moved = store.migrate_legacy(profiles)
+        if moved:
+            self._say(f"{moved} contraseña(s) pasadas al Administrador de credenciales de Windows.", "ok")
         self.profiles = profiles
         selected = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
@@ -240,7 +243,7 @@ class LauncherApp(tk.Tk):
             return
         if not messagebox.askyesno(
                 "Borrar perfil",
-                f"Se borra el perfil `{p['name']}`, su sesión de cf y su contraseña guardada.\n\n¿Seguir?",
+                f"Se borra el perfil `{p['name']}`. La sesión de cf y la contraseña del usuario se mantienen (las comparte cf-target).\n\n¿Seguir?",
                 parent=self):
             return
 
@@ -249,7 +252,6 @@ class LauncherApp(tk.Tk):
             if not res.get("ok"):
                 self._say(res.get("error"), "err")
                 return
-            store.set_password(p["name"], "")
             self._say(f"Perfil `{p['name']}` borrado.", "info")
             self._refresh_profiles()
 
@@ -263,12 +265,16 @@ class LauncherApp(tk.Tk):
         if p:
             self.login(p)
 
-    def login(self, p, password=None, then=None, on_fail=None):
+    def login(self, p, password=None, then=None, on_fail=None, remember=True):
         """
         Loguea el perfil. Con password: la guardada o la que se pase (si no hay,
         se pide). Con SSO: se abre el browser y se pide el passcode.
         `then` corre en el hilo de la UI si el login sale bien; `on_fail`, si
         falla o se cancela (con el motivo).
+
+        Una contrasena tipeada se guarda recien cuando cf la acepto (y si
+        `remember`): una mala guardada haria fallar cada corrida de cf-target y
+        podria bloquear la cuenta en el IdP.
         """
         def failed(reason):
             if on_fail:
@@ -284,12 +290,19 @@ class LauncherApp(tk.Tk):
                 return
             call = lambda: self.cli.login_sso(p["name"], code)
         else:
-            pw = password or store.get_password(p["name"]) or ask_secret(
+            stored = store.get_password(p["api"], p["user"])
+            pw = password or stored or ask_secret(
                 self, "Contraseña", f"Contraseña de {p['user'] or 'el usuario'} para {p['name']}:")
             if not pw:
                 failed("Login cancelado.")
                 return
-            call = lambda: self.cli.login_password(p["name"], pw)
+            typed = pw != stored
+
+            def call():
+                res = self.cli.login_password(p["name"], pw)
+                if res.get("ok") and typed and remember:
+                    store.set_password(p["api"], p["user"], pw)
+                return res
 
         self.status_var.set(f"Login de {p['name']}…")
 
@@ -657,7 +670,7 @@ class ProfileEditor(tk.Toplevel):
         row += 1
 
         ttk.Label(box, text="Contraseña").grid(row=row, column=0, sticky="w", **PAD)
-        self.pass_var = tk.StringVar(value=store.get_password(p["name"]) if p["name"] else "")
+        self.pass_var = tk.StringVar(value=store.get_password(p["api"], p["user"]) if p["user"] else "")
         self.pass_entry = ttk.Entry(box, textvariable=self.pass_var, show="•")
         self.pass_entry.grid(row=row, column=1, sticky="ew", **PAD)
         self.remember_var = tk.BooleanVar(value=True)
@@ -733,10 +746,8 @@ class ProfileEditor(tk.Toplevel):
             return None
         p = res["profile"]
         self.vars["port"].set(str(p["port"]))
-        if p["auth"] == "password" and self.remember_var.get():
-            store.set_password(p["name"], self.pass_var.get())
-        else:
-            store.set_password(p["name"], "")
+        # La contrasena no se guarda aca: es del usuario (la comparten cf-target y
+        # otros perfiles) y se guarda solo despues de un login aceptado (login()).
         return p
 
     def _connect(self):
@@ -752,7 +763,8 @@ class ProfileEditor(tk.Toplevel):
         self.conn_var.set("Conectando…")
         p = {**p, "problems": []}
         self.app.login(p, password=self.pass_var.get() or None, then=lambda: self._load_targets(p["name"]),
-                       on_fail=lambda reason: self.winfo_exists() and self.conn_var.set(reason[:60]))
+                       on_fail=lambda reason: self.winfo_exists() and self.conn_var.set(reason[:60]),
+                       remember=self.remember_var.get())
         self.app._refresh_profiles()
 
     def _load_targets(self, name):

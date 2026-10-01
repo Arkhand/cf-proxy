@@ -64,3 +64,11 @@ la trial; hay que corregirlo antes de usarlo.
   un fetch simple.
 
 Ver [[verificar-target]] antes de cualquier escritura.
+
+**Sesiones y contraseñas compartidas con cf-target (2026-10-01).** `lib/sessions.js` y
+`lib/targetfile.js` son copias exactas de `../cf-target/lib/` (el test
+`cf-target/test/vendored.test.js` avisa si se desfasan: editar allá y copiar). La sesión
+de cf es por (api, usuario) en `~/.cf-target/sessions/`; cada comando y cada proxy usa
+una copia privada. `profiles.load()` migra solas las sesiones viejas de
+`~/.cf-proxy/profiles/<p>/cf-home`. El launcher guarda contraseñas en el Credential
+Manager (`cf-target:<api>:<usuario>`) y migra `secrets.bin` al abrirse.
