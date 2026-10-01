@@ -1,0 +1,2 @@
+# Solo para armar el paquete (npm run dist). Para usar cf-proxy no hace falta.
+pyinstaller>=6

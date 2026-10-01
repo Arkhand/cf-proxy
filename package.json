@@ -11,7 +11,9 @@
     "start": "node bin/cf-proxy.js start",
     "ps": "node bin/cf-proxy.js ps",
     "test": "node test/destinations.test.js && node test/proxy-write.test.js && node test/profiles.test.js && node test/runs.test.js && node test/cf-home.test.js && node test/cli-runs.test.js",
-    "build:mta": "mbt build -t mta_archives"
+    "build:mta": "mbt build -t mta_archives",
+    "launcher": "python launcher/run_launcher.py",
+    "dist": "python launcher/build.py"
   },
   "engines": {
     "node": ">=16"

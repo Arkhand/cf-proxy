@@ -1,9 +1,10 @@
 """
 Arma el paquete distribuible.
 
-    python build.py
+    npm run dist            (desde la raiz del repo)
+    python launcher/build.py
 
-Deja en dist/ una carpeta lista para comprimir y pasar:
+Deja en launcher/dist/ una carpeta lista para comprimir y pasar:
 
     cf-proxy-launcher/
       cf-proxy.exe          <- doble clic
@@ -12,9 +13,11 @@ Deja en dist/ una carpeta lista para comprimir y pasar:
         cf-proxy/           <- el proyecto Node (sin node_modules: no tiene)
         cf-dest_1.0.0.mtar  <- pre-buildeado, para no exigir mbt en destino
 
-Requisitos para BUILDEAR (no para usar): pyinstaller. El .mtar se toma de
-cf-proxy/mta_archives/; si no esta, se corre `mbt build`.
+Requisitos para BUILDEAR (no para usar): Python 3 y PyInstaller
+(`pip install -r launcher/requirements-build.txt`). El .mtar se toma de
+mta_archives/ (esta versionado); si no esta, se corre `mbt build`.
 """
+import importlib.util
 import shutil
 import subprocess
 import sys
@@ -56,6 +59,20 @@ def find_mtar():
 
 
 def main():
+    # Antes de borrar el dist anterior: sin PyInstaller no hay con que rearmarlo.
+    if importlib.util.find_spec("PyInstaller") is None:
+        print("Falta PyInstaller. Instalarlo con:\n"
+              "    pip install -r launcher/requirements-build.txt")
+        return 1
+    # Un cf-proxy.exe abierto no se puede pisar; mejor avisar antes de borrar nada.
+    exe = DIST / "cf-proxy.exe"
+    if exe.exists():
+        try:
+            with open(exe, "ab"):
+                pass
+        except PermissionError:
+            print(f"{exe} esta abierto. Cerrar la ventana de cf-proxy y volver a correr: npm run dist")
+            return 1
     if DIST.exists():
         shutil.rmtree(DIST)
     recursos = DIST / "recursos"

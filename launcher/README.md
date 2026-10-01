@@ -68,17 +68,22 @@ credenciales > Credenciales de Windows), donde se ve y se borra. Se usa vía
 
 ## Desarrollo
 
+Desde la raíz del repo:
+
 ```bash
-python -m cfproxy_launcher     # correr desde el código
-python build.py                # armar dist/cf-proxy-launcher/
+npm run launcher                                 # correr la ventana desde el código
+pip install -r launcher/requirements-build.txt   # una vez: PyInstaller
+npm run dist                                     # armar launcher/dist/cf-proxy-launcher/
 ```
+
+(Equivalen a `python launcher/run_launcher.py` y `python launcher/build.py`.)
 
 `build.py` corre PyInstaller, copia el proyecto Node desde la raíz del repo
 (solo lo que hace falta en runtime: sin `node_modules`, `.env` ni
 `mta_archives`) y agrega el `.mtar` de `mta_archives/`; si no existe, corre
 `mbt build`.
 
-Para buildear hace falta `pyinstaller`. Para usarlo, no.
+Para armar el paquete hace falta PyInstaller (`launcher/requirements-build.txt`). Para usarlo, no.
 
 ### Módulos
 
