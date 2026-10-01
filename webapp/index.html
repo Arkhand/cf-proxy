@@ -77,7 +77,7 @@ sap.ui.getCore().attachInit(function () {
 			var login = health && health.login;
 			if (d.auth === "PrincipalPropagation") {
 				if (!login || !login.configured) {
-					return { state: "Error", text: "Requiere XSUAA propio (npm run deploy)" };
+					return { state: "Error", text: "Requiere XSUAA propio (desplegar el MTA)" };
 				}
 				if (!login.loggedIn) {
 					return { state: "Warning", text: "Requiere iniciar sesión" };
@@ -740,7 +740,7 @@ sap.ui.getCore().attachInit(function () {
 		//
 		// Cambiar de target reemplaza credenciales, tunel y cache del lado del
 		// proxy; por eso se pide confirmacion y despues se recarga todo. No
-		// cambia nada en BTP: es el mismo `cf target -o -s`.
+		// cambia nada en BTP. Con perfil, el org queda fijo (orgLocked).
 		// ---------------------------------------------------------------
 		function openTargetSelector() {
 			var error = new MessageStrip({ type: "Error", showIcon: true, visible: false });
@@ -768,6 +768,8 @@ sap.ui.getCore().attachInit(function () {
 					});
 					orgBox.setPlaceholder("Elegí un org");
 					if (body.current) { orgBox.setValue(body.current.org); fillSpaces(); spaceBox.setValue(body.current.space); }
+					// Proxy de un perfil: el org es la subcuenta del perfil, solo cambia el space.
+					orgBox.setEnabled(!body.orgLocked);
 				})
 				.catch(function (e) { error.setText(e.message).setVisible(true); })
 				.finally(function () { BusyIndicator.hide(); });
@@ -793,8 +795,8 @@ sap.ui.getCore().attachInit(function () {
 				contentWidth: "34rem",
 				content: [ new VBox({ items: [
 					new MessageStrip({ type: "Information", showIcon: true, text:
-						"Cambia el target del CLI de `cf` (como `cf target -o -s`) y vuelve a descubrir los servicios. " +
-						"No modifica nada en BTP. Las destinations que veas después son las del nuevo subaccount."
+						"Cambia el space de este proxy (el org es el del perfil) y vuelve a descubrir los servicios. " +
+						"Solo afecta a este proxy: no cambia el `cf target` de la terminal ni el de otros proxies. No modifica nada en BTP."
 					}).addStyleClass("sapUiSmallMarginBottom"),
 					formRow("Org", orgBox, true),
 					formRow("Space", spaceBox, true),

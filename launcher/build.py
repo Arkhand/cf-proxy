@@ -7,7 +7,7 @@ Deja en dist/ una carpeta lista para comprimir y pasar:
 
     cf-proxy-launcher/
       cf-proxy.exe          <- doble clic
-      LEEME.txt
+      LEEME.md              <- guia de uso para el que lo recibe
       recursos/
         cf-proxy/           <- el proyecto Node (sin node_modules: no tiene)
         cf-dest_1.0.0.mtar  <- pre-buildeado, para no exigir mbt en destino
@@ -27,51 +27,13 @@ DIST = ROOT / "dist" / "cf-proxy-launcher"
 
 # Lo que el proxy necesita en runtime. Se listan a mano para no arrastrar
 # mta_archives, .env, node_modules ni el historial de git.
-PROXY_FILES = ["server.js", "package.json", "README.md"]
-PROXY_DIRS = ["lib", "webapp"]
+# xs-security.json: el proxy lo lee para avisar si el puerto del perfil no
+# esta en las redirect-uris del XSUAA.
+PROXY_FILES = ["server.js", "package.json", "README.md", "xs-security.json"]
+PROXY_DIRS = ["bin", "lib", "webapp"]
 
-LEEME = """cf-proxy
-========
-
-Proxy local hacia las destinations de un subaccount de SAP BTP.
-
-USO
----
-Doble clic en cf-proxy.exe. Elegis cuenta, org/space y puerto, y arranca.
-
-REQUISITOS
-----------
-Tienen que estar instalados y en el PATH:
-
-  - Cloud Foundry CLI (cf)   winget install CloudFoundry.CloudFoundryCLI
-  - Node.js                  winget install OpenJS.NodeJS.LTS
-
-El programa los verifica al arrancar y avisa si falta alguno.
-
-QUE HACE
---------
-1. Te conecta a Cloud Foundry (contrasena o SSO).
-2. Lista los orgs y spaces a los que tenes acceso.
-3. Si al space le faltan los recursos que necesita, ofrece desplegarlos.
-4. Levanta el proxy y abre la pagina en el browser.
-
-Desde la pagina podes ver, probar, crear, editar y borrar destinations.
-
-POR LINEA DE COMANDOS
----------------------
-Sigue funcionando igual, en recursos/cf-proxy:
-
-    node server.js --port 3100
-    node server.js --list
-
-DONDE SE GUARDA LA CONFIGURACION
---------------------------------
-%APPDATA%\\cf-proxy-launcher\\
-
-  profiles.json   perfiles (endpoint, usuario, org/space, puerto). Sin secretos.
-  secrets.bin     contrasenas, cifradas con tu cuenta de Windows (DPAPI).
-                  El archivo no sirve en otra PC ni para otro usuario.
-"""
+# La guia para el que recibe el paquete. Se edita en launcher/LEEME.md.
+LEEME = ROOT / "LEEME.md"
 
 
 def run(args, cwd=None):
@@ -130,7 +92,7 @@ def main():
     else:
         print("  AVISO: sin .mtar. El launcher no va a poder desplegar recursos.")
 
-    (DIST / "LEEME.txt").write_text(LEEME, encoding="utf-8")
+    shutil.copy2(LEEME, DIST / "LEEME.md")
 
     size = sum(f.stat().st_size for f in DIST.rglob("*") if f.is_file())
     print(f"\nListo: {DIST}  ({size / 1024 / 1024:.1f} MB)")

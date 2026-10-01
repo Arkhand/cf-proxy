@@ -20,7 +20,17 @@ Hecho y verificado contra la trial:
 - Launcher en Python/tkinter que empaqueta a un .exe de ~10 MB con el proyecto
   Node y el .mtar pre-buildeado al lado.
 
-`npm test` son 104 tests contra servicios falsos (sin tocar BTP).
+`npm test` corre 6 suites contra servicios y un `cf` falsos (sin tocar BTP).
+
+**Multi-instancia (2026-10-01):** perfiles por subcuenta (`lib/profiles.js`),
+CF_HOME por perfil, registro/lock de corridas (`lib/runs.js`), consola
+`bin/cf-proxy.js` (profiles/login/targets/start/stop/ps/logs/cf) y launcher con
+una pestana por corrida. Verificado contra etp-shared-lab: login en el CF_HOME
+del perfil, start en segundo plano, tunel en puerto libre, 409 al cambiar de
+org, stop sin `cf ssh` huerfano, y `~/.cf/config.json` sin cambios.
+Pendiente: redirect-uris de XSUAA para puertos != 3100 (ver README §6); hasta
+actualizar el `cf-dest-xsuaa` de cada subcuenta, el login de usuario solo anda
+en el perfil que tenga el 3100.
 
 **Pendiente principal: PrincipalPropagation.** Llega al S/4 y recibe 401 con
 `WWW-Authenticate: Basic`, o sea el Cloud Connector no envio el certificado
@@ -29,8 +39,11 @@ configuracion del CC de BMS (sospecha principal: Principal Type en `None`),
 no codigo.
 
 **Trial de prueba:** org `5e80c1b2trial` / space `dev`, api `us10-001`. Tiene
-desplegado el MTA `cf-dest` completo. Para probar: `cf login` a esa trial y
-`node server.js`. Para dejarla limpia: `npm run undeploy`.
+desplegado el MTA `cf-dest` completo. Para probar: un perfil a esa trial,
+`cf-proxy login <p>` y `cf-proxy start <p>`. Para dejarla limpia:
+`cf-proxy cf <p> -- undeploy cf-dest --delete-services --delete-service-keys -f`.
+Ojo: el perfil importado `Trial` apunta a BMS-BLD/BLD en us10-001, que no es
+la trial; hay que corregirlo antes de usarlo.
 
 **Hallazgos del servicio real, no derivables del codigo:**
 

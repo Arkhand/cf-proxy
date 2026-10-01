@@ -1,18 +1,19 @@
 # cf-proxy launcher
 
-Ventana para arrancar [cf-proxy](../) sin tocar la terminal, y
-paquete listo para pasarle a un colega.
+Consola de administración y lanzamiento de [cf-proxy](../), y paquete listo
+para pasarle a un colega.
 
-**No reemplaza nada del proxy.** Junta credenciales, org/space y opciones, y
-ejecuta el mismo `node server.js` que se corre a mano. La línea de comandos
-sigue funcionando igual.
+**No reemplaza nada del proxy.** Todo lo que hace pasa por la consola
+`node bin/cf-proxy.js ... --json`: la misma que se usa desde una terminal o
+desde una IA. Por eso la ventana muestra también los proxies que se lanzaron
+por consola, y la consola ve los que lanzó la ventana.
 
 ## Para el que lo recibe
 
 ```
 cf-proxy-launcher/
   cf-proxy.exe          ← doble clic
-  LEEME.txt
+  LEEME.md              ← guía de uso (fuente: launcher/LEEME.md)
   recursos/
     cf-proxy/           ← el proyecto Node
     cf-dest_1.0.0.mtar  ← pre-buildeado (no hace falta mbt)
@@ -23,26 +24,41 @@ verifica al arrancar y, si falta alguno, lo dice con el comando de `winget`
 para instalarlo. No se incluyen a propósito: son herramientas que conviene
 mantener actualizadas por fuera.
 
+La guía completa para el que recibe el paquete está en [LEEME.md](LEEME.md):
+perfiles, arranque, login de usuario, consola y problemas frecuentes.
+
 ## Qué hace la ventana
 
 1. **Requisitos** — `cf` y `node`. Si falta uno, no deja seguir.
-2. **Cuenta** — perfil guardado, API endpoint, usuario, y login por
-   contraseña o SSO. Si ya hay sesión de `cf` abierta, la aprovecha.
-3. **Destino** — org y space se llenan con lo que el usuario realmente puede
-   ver (API v3, igual que el proxy). Puerto (default 3100) y los flags
-   (`--tunnel`, `--login`, `--create-keys`).
-4. **Recursos** — si el space no tiene `cf-dest-destination`, ofrece
-   desplegar el `.mtar` incluido. Sin `mbt` en la PC destino.
-5. **Arranca** — lanza el proxy, muestra el log y abre la página.
+2. **Perfiles** (arriba) — uno por subcuenta de cliente, cada uno con su
+   puerto. Alta: datos de la cuenta → *Conectar y listar orgs* (loguea con la
+   sesión **propia del perfil**, nunca la global de `cf`) → elegir org/space →
+   *Guardar*. Los perfiles con problemas (puerto repetido, sin org) se ven en
+   rojo y no arrancan.
+3. **Iniciar** — `cf-proxy start <perfil>`. Si el perfil no tiene sesión, pide
+   login y reintenta. Si el space no tiene `cf-dest-destination`, ofrece
+   desplegar el `.mtar` incluido **con la sesión del perfil**. Sin `mbt` en la
+   PC destino.
+4. **Pestañas** (abajo) — una por proxy corriendo, de cualquier origen: estado
+   (health), usuario, org/space, puerto, de dónde se lanzó y el log en vivo.
+   *Abrir página*, *Detener*, *Cerrar pestaña* (detiene y la saca). Se
+   actualizan solas cada 3 s con `cf-proxy ps`.
+5. **Al cerrar** — pregunta solo por los proxies que lanzó esta ventana: Sí
+   (detenerlos), No (dejarlos corriendo), Cancelar. Los lanzados por consola
+   no se tocan.
 
 ## Dónde se guarda la configuración
 
-`%APPDATA%\cf-proxy-launcher\`
-
-| Archivo | Qué tiene |
+| Dónde | Qué tiene |
 |---|---|
-| `profiles.json` | Perfiles: endpoint, usuario, org/space, puerto, flags. **Sin secretos.** |
-| `secrets.bin` | Contraseñas, cifradas con **DPAPI** (la cuenta de Windows). |
+| `~/.cf-proxy/profiles.json` | Perfiles: endpoint, usuario, org/space, puerto, flags. **Sin secretos.** Compartidos con la consola. |
+| `~/.cf-proxy/profiles/<p>/cf-home` | La sesión de `cf` de cada perfil. |
+| `~/.cf-proxy/runs/` | Proxies corriendo (`<p>.json`) y su salida (`<p>.log`). |
+| `%APPDATA%\cf-proxy-launcher\secrets.bin` | Contraseñas por perfil, cifradas con **DPAPI** (la cuenta de Windows). |
+
+La primera vez que corre, la consola importa los perfiles del launcher viejo
+(`%APPDATA%\cf-proxy-launcher\profiles.json`). Los que choquen en puerto
+quedan marcados hasta corregirlos.
 
 La contraseña nunca se escribe en texto plano y el archivo cifrado **no sirve
 en otra PC ni para otro usuario**: DPAPI ata la clave a la cuenta de Windows.
@@ -66,8 +82,9 @@ Para buildear hace falta `pyinstaller`. Para usarlo, no.
 
 | Archivo | Responsabilidad |
 |---|---|
-| `store.py` | Perfiles (JSON) y contraseñas (DPAPI) |
-| `cf.py` | Único que ejecuta `cf` y `node`. Devuelve datos normalizados |
+| `store.py` | Contraseñas por perfil (DPAPI) |
+| `cf.py` | Requisitos: `cf` y `node` instalados |
+| `cli.py` | Todo lo demás: llama a `node bin/cf-proxy.js ... --json` |
 | `paths.py` | Dónde está cada cosa, empaquetado o en el repo |
 | `app.py` | La ventana (tkinter) |
 | `run_launcher.py` | Entry point de PyInstaller (import absoluto) |

@@ -13,31 +13,41 @@
  * La unica convencion son los nombres de lo que despliega mta.yaml (cf-dest-*):
  * si existen, se usan directo.
  *
- * Los 6 pasos, en orden:
- *   [1] Verificar que hay sesion de CF.
+ * Siempre arranca desde un PERFIL guardado (lib/profiles.js): una subcuenta
+ * de cliente, con su puerto y su propio CF_HOME. Nunca usa la sesion global
+ * de `cf`, asi que no cambia el target de la terminal ni el de otro proxy.
+ * Lo normal es arrancarlo con la consola (bin/cf-proxy.js start <perfil>),
+ * que lo deja corriendo en segundo plano y lo registra.
+ *
+ * Los pasos, en orden:
+ *   [0] Cargar el perfil, tomar el lock de la corrida y verificar el puerto.
+ *   [1] Verificar que hay sesion de CF en el perfil y apuntar a su org/space.
  *   [2] Descubrir las instancias de servicio del space.
  *   [3] Obtener credenciales (instancias propias primero; si no, reusar keys).
  *   [4] Login de usuario contra XSUAA (solo hace falta para PrincipalPropagation).
  *   [5] Verificar acceso al Connectivity Proxy (solo hace falta para on-premise).
  *   [6] Levantar el proxy local.
  *
- * Uso:
- *   node server.js                         arranca el proxy
- *   node server.js --list                  solo lista las destinations y sale
- *   node server.js --login                 arranca y abre el login de usuario en el browser
- *   node server.js --create-keys           permite crear service keys si hace falta
- *   node server.js --port 3100             puerto local (default 3100)
- *   node server.js --xsuaa <instancia>     usar otra instancia de xsuaa para el login
- *   node server.js --tunnel                forzar el tunel `cf ssh` al Connectivity Proxy
+ * Uso (puerto y flags salen del perfil; estos los suman, no los quitan):
+ *   node server.js --profile <p>           arranca el proxy del perfil, en primer plano
+ *   node server.js --profile <p> --list    solo lista las destinations y sale
+ *   --login                                abre el login de usuario en el browser
+ *   --create-keys                          permite crear service keys si hace falta
+ *   --xsuaa <instancia>                    usar otra instancia de xsuaa para el login
+ *   --tunnel                               forzar el tunel `cf ssh` al Connectivity Proxy
  *                                          (automatico si existe cf-dest-app)
- *   node server.js --tunnel-app <app>      app a usar para el tunel (default: cf-dest-app o una con SSH)
- *   node server.js --tunnel-port <n>       puerto local del tunel (default 20003)
- *   node server.js --connectivity-proxy host:port
- *                                          usar un Connectivity Proxy ya alcanzable
- *   node server.js --no-open               no abrir la pagina de diagnostico en el browser
+ *   --tunnel-app <app>                     app a usar para el tunel (default: cf-dest-app o una con SSH)
+ *   --tunnel-port <n>                      puerto local del tunel (default: uno libre)
+ *   --connectivity-proxy host:port         usar un Connectivity Proxy ya alcanzable
+ *   --no-open                              no abrir la pagina de diagnostico en el browser
+ *   --origin cli|ui                        quien lo lanzo (lo pone la consola; se ve en `ps`)
+ *   --log <archivo>                        donde escribe la salida (lo pone la consola)
  */
 const { exec } = require("child_process");
+const net = require("net");
 const cf = require("./lib/cf");
+const profiles = require("./lib/profiles");
+const runs = require("./lib/runs");
 const { discover, OWN } = require("./lib/discover");
 const { makeDestinationClient, makeTokenProvider } = require("./lib/destinations");
 const { makeAuth } = require("./lib/auth");
@@ -50,18 +60,59 @@ const value = (flag, fallback) => {
 	return i !== -1 && args[i + 1] ? args[i + 1] : fallback;
 };
 
-const PORT = Number(value("--port", process.env.PORT || 3100));
-const ALLOW_CREATE = has("--create-keys");
-const LIST_ONLY = has("--list");
-const LOGIN = has("--login");
-const XSUAA_INSTANCE = value("--xsuaa", null);
-const FORCE_TUNNEL = has("--tunnel");
-const TUNNEL_APP = value("--tunnel-app", null);
-const TUNNEL_PORT = Number(value("--tunnel-port", 20003));
-const MANUAL_CONN_PROXY = value("--connectivity-proxy", null);
-const OPEN_BROWSER = !has("--no-open");
-
 const log = (m) => console.log(m);
+
+/** Corta la ejecucion con un mensaje de error legible. `code`: ver runs.EXIT. */
+function fail(title, hint, code = runs.EXIT.ERROR) {
+	console.error(`\n  ERROR: ${title}`);
+	if (hint) console.error(`  ${hint}`);
+	console.error("");
+	process.exit(code);
+}
+
+// ============================================================================
+// PASO 0a - El perfil manda: puerto, flags, org/space y CF_HOME salen de ahi
+// ============================================================================
+const PROFILE_NAME = value("--profile", null);
+const CLI_HINT = "node bin/cf-proxy.js";
+
+if (!PROFILE_NAME) {
+	const names = profiles.load().map((p) => p.name);
+	fail(
+		"Falta --profile. cf-proxy solo arranca desde un perfil guardado.",
+		(names.length ? `Perfiles: ${names.join(", ")}. ` : "No hay perfiles: crear uno con `" + CLI_HINT + " profiles add`. ") +
+			`Arrancar con: ${CLI_HINT} start <perfil>`,
+		runs.EXIT.USAGE
+	);
+}
+
+const PROFILE = profiles.get(PROFILE_NAME);
+if (!PROFILE) {
+	fail(`No existe el perfil ${PROFILE_NAME}.`, `Ver: ${CLI_HINT} profiles list`, runs.EXIT.USAGE);
+}
+if (PROFILE.problems.length) {
+	fail(`El perfil ${PROFILE_NAME} no puede arrancar: ${PROFILE.problems.join("; ")}.`,
+		`Corregirlo con: ${CLI_HINT} profiles edit ${PROFILE_NAME} ...`, runs.EXIT.USAGE);
+}
+
+// Desde aca, todo `cf` corre en el CF_HOME del perfil.
+cf.configure({ cfHome: profiles.cfHomeOf(PROFILE.name) });
+
+const PORT = PROFILE.port;
+const ALLOW_CREATE = has("--create-keys") || PROFILE.flags.create_keys;
+const LIST_ONLY = has("--list");
+const LOGIN = has("--login") || PROFILE.flags.login;
+const XSUAA_INSTANCE = value("--xsuaa", null);
+const FORCE_TUNNEL = has("--tunnel") || PROFILE.flags.tunnel;
+const TUNNEL_APP = value("--tunnel-app", null);
+const FIXED_TUNNEL_PORT = value("--tunnel-port", null);
+const MANUAL_CONN_PROXY = value("--connectivity-proxy", null);
+const OPEN_BROWSER = !has("--no-open") && PROFILE.flags.open_browser;
+const ORIGIN = value("--origin", "foreground");
+const LOG_FILE = value("--log", null);
+
+// Registro de la corrida (lock). Lo completa el PASO 0b; --list no lo toma.
+let run = null;
 
 /** Abre una URL en el browser por default del sistema. Si falla, no importa: la URL esta en consola. */
 function openBrowser(url) {
@@ -72,14 +123,6 @@ function openBrowser(url) {
 	exec(cmd, () => {});
 }
 
-/** Corta la ejecucion con un mensaje de error legible. */
-function fail(title, hint) {
-	console.error(`\n  ERROR: ${title}`);
-	if (hint) console.error(`  ${hint}`);
-	console.error("");
-	process.exit(1);
-}
-
 // Proceso del tunel SSH, si se abrio. Se cierra al salir para no dejar
 // un `cf ssh` huerfano colgado del puerto.
 let tunnelProcess = null;
@@ -88,6 +131,7 @@ function closeTunnel() {
 	if (tunnelProcess && !tunnelProcess.killed) {
 		tunnelProcess.kill();
 		tunnelProcess = null;
+		if (run) run.update({ tunnelPid: null });
 	}
 }
 
@@ -97,7 +141,33 @@ for (const signal of ["SIGINT", "SIGTERM"]) {
 		process.exit(0);
 	});
 }
-process.on("exit", closeTunnel);
+process.on("exit", () => {
+	closeTunnel();
+	// Soltar el lock: el perfil queda libre para otro arranque.
+	if (run) run.release();
+});
+
+/** Un puerto local libre, elegido por el sistema. Para el tunel: dos proxies no pueden compartirlo. */
+function freePort() {
+	return new Promise((resolve, reject) => {
+		const srv = net.createServer();
+		srv.unref();
+		srv.on("error", reject);
+		srv.listen(0, "127.0.0.1", () => {
+			const { port } = srv.address();
+			srv.close(() => resolve(port));
+		});
+	});
+}
+
+/** true si el puerto del proxy esta libre. Se prueba igual que lo va a abrir server.listen. */
+function portFree(port) {
+	return new Promise((resolve) => {
+		const srv = net.createServer();
+		srv.once("error", () => resolve(false));
+		srv.listen(port, () => srv.close(() => resolve(true)));
+	});
+}
 
 /**
  * PASO 5b - Elegir la app por la que abrir el tunel SSH.
@@ -139,13 +209,15 @@ async function openTunnel(remoteHost, remotePort) {
 			ok: false,
 			reason:
 				"Ninguna app STARTED del space tiene SSH habilitado.\n" +
-				"     Opciones: npm run deploy (despliega cf-dest-app), o habilitarlo en una:\n" +
+				"     Opciones: cf-proxy cf <perfil> -- deploy <mtar> (despliega cf-dest-app), o habilitarlo en una:\n" +
 				"     cf enable-ssh <app> && cf restart <app>, o indicar una con --tunnel-app <app>."
 		};
 	}
 
-	log(`  Abriendo tunel via ${appName}: localhost:${TUNNEL_PORT} -> ${remoteHost}:${remotePort}`);
-	tunnelProcess = cf.startTunnel({ appName, localPort: TUNNEL_PORT, remoteHost, remotePort });
+	const localPort = FIXED_TUNNEL_PORT ? Number(FIXED_TUNNEL_PORT) : await freePort();
+	log(`  Abriendo tunel via ${appName}: localhost:${localPort} -> ${remoteHost}:${remotePort}`);
+	tunnelProcess = cf.startTunnel({ appName, localPort, remoteHost, remotePort });
+	if (run) run.update({ tunnelPid: tunnelProcess.pid });
 
 	// Se junta la salida por si el tunel falla, para mostrar el motivo real.
 	let output = "";
@@ -158,9 +230,9 @@ async function openTunnel(remoteHost, remotePort) {
 			return { ok: false, reason: `\`cf ssh\` termino solo: ${output.trim().slice(0, 300) || "sin detalle"}` };
 		}
 
-		const probe = await probeTcp("127.0.0.1", TUNNEL_PORT, 1000);
+		const probe = await probeTcp("127.0.0.1", localPort, 1000);
 		if (probe.ok) {
-			return { ok: true, appName };
+			return { ok: true, appName, localPort };
 		}
 
 		await new Promise((r) => setTimeout(r, 1000));
@@ -221,12 +293,12 @@ async function resolveConnectivity(creds) {
 			fail("No se pudo abrir el tunel SSH.", tunnel.reason);
 		}
 
-		log(`  OK  Connectivity Proxy via tunel SSH (app ${tunnel.appName}) en localhost:${TUNNEL_PORT}`);
-		return { connectivity: { proxyHost: "127.0.0.1", proxyPort: TUNNEL_PORT }, note: "" };
+		log(`  OK  Connectivity Proxy via tunel SSH (app ${tunnel.appName}) en localhost:${tunnel.localPort}`);
+		return { connectivity: { proxyHost: "127.0.0.1", proxyPort: tunnel.localPort }, note: "" };
 	}
 
 	// --- Sin acceso: se sigue solo con destinations de Internet ---------------
-	log("      Correr con --tunnel (o npm run deploy) para abrirlo via `cf ssh`. Se sigue solo con destinations de Internet.");
+	log("      Correr con --tunnel (o cf-proxy cf <perfil> -- deploy <mtar>) para abrirlo via `cf ssh`. Se sigue solo con destinations de Internet.");
 	return {
 		connectivity: null,
 		note:
@@ -237,16 +309,70 @@ async function resolveConnectivity(creds) {
 
 async function main() {
 	console.log("\n  cf-proxy - proxy local via servicios de Cloud Foundry\n");
+	log(`  Perfil: ${PROFILE.title} (${PROFILE.name})  ->  ${PROFILE.org} / ${PROFILE.space}  puerto ${PORT}\n`);
 
 	// ========================================================================
-	// PASO 1 - Sesion de CF
+	// PASO 0b - Lock de la corrida y puerto libre
 	// ========================================================================
-	log("[1/6] Verificando sesion de Cloud Foundry...");
+	// Antes de cualquier otra cosa: si el perfil ya corre, no se abre un
+	// segundo tunel ni se pisa el puerto. --list no corre nada, no lo necesita.
+	if (!LIST_ONLY) {
+		const lock = runs.acquire(PROFILE.name, {
+			title: PROFILE.title,
+			port: PORT,
+			url: `http://localhost:${PORT}/`,
+			api: PROFILE.api,
+			org: PROFILE.org,
+			space: PROFILE.space,
+			user: PROFILE.user,
+			origin: ORIGIN,
+			log: LOG_FILE
+		});
+		if (lock.busy) {
+			const r = lock.record;
+			fail(`El perfil ${PROFILE.name} ya esta corriendo${r ? ` (pid ${r.pid}) en ${r.url}` : ""}.`,
+				`Ver: ${CLI_HINT} ps   Detener: ${CLI_HINT} stop ${PROFILE.name}`, runs.EXIT.BUSY);
+		}
+		run = lock;
+
+		// Se chequea ANTES del tunel: un EADDRINUSE despues dejaria un `cf ssh` colgado.
+		if (!(await portFree(PORT))) {
+			fail(`El puerto ${PORT} esta ocupado por otro programa.`,
+				`Liberarlo, o cambiar el puerto del perfil: ${CLI_HINT} profiles edit ${PROFILE.name} --port auto`,
+				runs.EXIT.PORT_BUSY);
+		}
+	}
+
+	// ========================================================================
+	// PASO 1 - Sesion de CF (la del perfil) y target fijo
+	// ========================================================================
+	log("[1/6] Verificando sesion de Cloud Foundry del perfil...");
 	const session = await cf.checkLogin();
 
 	if (!session.ok) {
-		fail(session.reason === "no-cli" ? "El CLI `cf` no esta disponible." : "No hay sesion de CF activa.", session.hint);
+		if (session.reason === "no-cli") {
+			fail("El CLI `cf` no esta disponible.", session.hint);
+		}
+		fail(`El perfil ${PROFILE.name} no tiene sesion de CF (o vencio).`,
+			`Loguearse con: ${CLI_HINT} login ${PROFILE.name}`, runs.EXIT.NO_SESSION);
 	}
+
+	if (profiles.normalizeApi(session.api) !== profiles.normalizeApi(PROFILE.api)) {
+		fail(`La sesion del perfil es de ${session.api}, pero el perfil dice ${PROFILE.api}.`,
+			`Volver a loguearse con: ${CLI_HINT} login ${PROFILE.name}`, runs.EXIT.NO_SESSION);
+	}
+
+	// Siempre se apunta al org/space del perfil. Es seguro: el CF_HOME es solo
+	// de este perfil, y deja el arranque deterministico aunque alguien haya
+	// cambiado de space desde la pagina en la corrida anterior.
+	const targeted = await cf.setTarget(PROFILE.org, PROFILE.space);
+	if (!targeted.ok) {
+		fail(`No se pudo apuntar a ${PROFILE.org} / ${PROFILE.space}: ${targeted.error}`,
+			"Revisar el org/space del perfil, o el acceso del usuario a esa subcuenta.");
+	}
+	session.org = PROFILE.org;
+	session.space = PROFILE.space;
+	if (run) run.update({ user: session.user });
 
 	log(`  OK  ${session.user}`);
 	log(`      org: ${session.org} / space: ${session.space}`);
@@ -258,7 +384,9 @@ async function main() {
 	const found = await discover({ allowCreate: ALLOW_CREATE, preferredXsuaa: XSUAA_INSTANCE, log });
 
 	if (!found.ok) {
-		fail(found.error, "Revisar que el space tenga una instancia del servicio `destination`, o correr npm run deploy.");
+		fail(found.error,
+			`Revisar que el space tenga una instancia del servicio \`destination\`, o desplegar los recursos: ${CLI_HINT} cf ${PROFILE.name} -- deploy mta_archives/cf-dest_1.0.0.mtar -f`,
+			runs.EXIT.NO_RESOURCES);
 	}
 
 	// Contexto MUTABLE: todo lo que depende del subaccount. El proxy lo lee en
@@ -269,7 +397,9 @@ async function main() {
 		connectivity: null,          // lo completa el PASO 5
 		connTokenProvider: null,
 		connectivityNote: "",
-		cfTarget: { org: session.org, space: session.space, user: session.user }
+		cfTarget: { org: session.org, space: session.space, user: session.user },
+		// Un perfil es una subcuenta: desde la pagina se cambia de space, no de org.
+		lockedOrg: PROFILE.org
 	};
 
 	const connCreds = found.connectivity ? found.connectivity.creds : null;
@@ -283,6 +413,11 @@ async function main() {
 		creds: found.xsuaa ? found.xsuaa.creds : null,
 		callbackUrl: `http://localhost:${PORT}/__callback`
 	});
+
+	const portWarning = auth.configured ? profiles.checkXsuaaPort(PORT) : null;
+	if (portWarning) {
+		log(`  !!  ${portWarning}`);
+	}
 
 	if (!auth.configured) {
 		log(`  --  no disponible: ${found.xsuaaReason.split("\n")[0]}`);
@@ -315,7 +450,7 @@ async function main() {
 		for (const d of pp) {
 			const how = auth.configured
 				? (auth.status().loggedIn ? "login OK, requiere tunel" : "requiere login + tunel")
-				: "requiere XSUAA propio: npm run deploy";
+				: "requiere XSUAA propio: cf-proxy cf <perfil> -- deploy <mtar>";
 			log(`   ~  ${d.name}  (PrincipalPropagation: ${how})`);
 		}
 
@@ -332,15 +467,18 @@ async function main() {
 	ctx.connectivityNote = paso5.note;
 
 	/**
-	 * Cambiar de org/space sin reiniciar.
+	 * Cambiar de space sin reiniciar (el org es el del perfil, fijo).
 	 *
-	 * Reapunta el CLI y rehace los pasos 2, 3 y 5: las credenciales del
-	 * subaccount anterior no sirven en el nuevo. Si algo falla, se restaura el
-	 * target anterior y el contexto queda intacto.
+	 * Reapunta el CLI del perfil y rehace los pasos 2, 3 y 5: las
+	 * credenciales del space anterior pueden no servir. Si algo falla, se
+	 * restaura el target anterior y el contexto queda intacto.
 	 *
 	 * El tunel SSH se cierra siempre: cuelga de una app del space viejo.
 	 */
 	async function retarget(org, space) {
+		if (org !== PROFILE.org) {
+			return { ok: false, error: `Este proxy es del org ${PROFILE.org}; ${org} necesita su propio perfil.` };
+		}
 		const previous = { ...ctx.cfTarget };
 		log(`\n  Cambiando target a ${org} / ${space}...`);
 
@@ -366,6 +504,7 @@ async function main() {
 		ctx.connectivity = conn.connectivity;
 		ctx.connectivityNote = conn.note;
 		ctx.cfTarget = { org, space, user: previous.user };
+		if (run) run.update({ space });
 
 		log(`  OK  target: ${org} / ${space}\n`);
 		return { ok: true };
@@ -376,9 +515,18 @@ async function main() {
 	// ========================================================================
 	log("\n[6/6] Levantando proxy local...");
 
-	const server = createProxyServer({ ctx, auth, onRetarget: retarget, log });
+	const server = createProxyServer({
+		ctx,
+		auth,
+		onRetarget: retarget,
+		listTargets: () => cf.listSpaces(PROFILE.org),
+		identity: { profile: PROFILE.name, title: PROFILE.title, pid: process.pid, port: PORT },
+		log
+	});
 
 	server.listen(PORT, () => {
+		// Recien ahora la corrida esta lista: `start` de la consola espera esto.
+		if (run) run.update({ state: "listening" });
 		console.log(`\n  Escuchando en http://localhost:${PORT}`);
 		console.log(`  Pagina:   http://localhost:${PORT}/`);
 		console.log(`  Uso:      http://localhost:${PORT}/<NOMBRE_DESTINATION>/<path>`);
@@ -387,7 +535,7 @@ async function main() {
 		console.log(`  Estado:   http://localhost:${PORT}/__health`);
 		console.log(`  Probar:   http://localhost:${PORT}/__test/<NOMBRE>`);
 		console.log(`  Editar:   desde la pagina (botones Nueva destination / Editar; piden confirmacion)`);
-		console.log(`  Login:    ${auth.configured ? `http://localhost:${PORT}/__login` : "no disponible (npm run deploy)"}`);
+		console.log(`  Login:    ${auth.configured ? `http://localhost:${PORT}/__login` : "no disponible (cf-proxy cf <perfil> -- deploy <mtar>)"}`);
 		console.log(`  Target:   ${ctx.cfTarget.org} / ${ctx.cfTarget.space}  (se cambia desde la pagina)`);
 		console.log(`  On-prem:  ${ctx.connectivity ? "si" : "no (ver /__health)"}\n`);
 
@@ -399,7 +547,8 @@ async function main() {
 	});
 
 	server.on("error", (e) => {
-		fail(`No se pudo abrir el puerto ${PORT}: ${e.message}`, "Probar con --port <otro>.");
+		fail(`No se pudo abrir el puerto ${PORT}: ${e.message}`,
+			`Cambiar el puerto del perfil: ${CLI_HINT} profiles edit ${PROFILE.name} --port auto`, runs.EXIT.PORT_BUSY);
 	});
 }
 

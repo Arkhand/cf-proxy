@@ -216,6 +216,30 @@ server.listen(0, async () => {
 	ok("/__test llamo al cliente de verdad", calls.some((c) => c.fn === "resolve" && c.name === "NO_EXISTE_TEST"));
 	ok("/__test nunca escribe", !calls.some((c) => c.fn === "create" || c.fn === "update" || c.fn === "remove"));
 
+	// --- perfil: org fijo e identidad en /__health ----------------------------
+	// Como lo arma server.js: el org del perfil queda fijo y /__targets lista
+	// solo sus spaces.
+	ctx.lockedOrg = "ORG-TEST";
+	const locked = createProxyServer({
+		ctx, auth, onRetarget: retarget, log: () => {},
+		listTargets: async () => [{ org: "ORG-TEST", spaces: ["SPACE-TEST", "OTRO-SPACE"] }],
+		identity: { profile: "acme", title: "ACME", pid: 1234, port: 9999 }
+	});
+	await new Promise((resolve) => locked.listen(0, resolve));
+	const lp = locked.address().port;
+
+	r = await call(lp, "GET", "/__targets");
+	ok("/__targets con perfil avisa orgLocked", r.status === 200 && r.json.orgLocked === true && r.json.targets.length === 1);
+	calls.length = 0;
+	r = await call(lp, "POST", "/__target", { org: "OTRO-ORG", space: "X" });
+	ok("POST /__target a otro org da 409", r.status === 409 && /ORG-TEST/.test(r.json.error));
+	ok("y no llega a reapuntar", !calls.some((c) => c.fn === "retarget"));
+	r = await call(lp, "POST", "/__target", { org: "ORG-TEST", space: "OTRO-SPACE" });
+	ok("POST /__target a otro space del mismo org anda", r.status === 200 && r.json.target.space === "OTRO-SPACE");
+	r = await call(lp, "GET", "/__health");
+	ok("/__health trae la identidad del perfil", r.json.profile === "acme" && r.json.pid === 1234 && r.json.port === 9999 && r.json.title === "ACME");
+	locked.close();
+
 	console.log("");
 	console.log(failed ? failed + " test(s) FALLARON" : "Todos los tests pasaron");
 	server.close();

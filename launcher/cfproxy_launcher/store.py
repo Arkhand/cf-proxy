@@ -1,19 +1,19 @@
 """
-PASO 1 - Perfiles y contrasenas.
+PASO 1 - Contrasenas guardadas.
 
-Dos almacenamientos separados a proposito:
+Los PERFILES ya no viven aca: los maneja la consola de cf-proxy
+(~/.cf-proxy/profiles.json), para que la ventana, la terminal y las skills
+vean los mismos. Este modulo solo guarda las contrasenas, una por perfil
+(la clave es el nombre del perfil).
 
-  - Los PERFILES (api endpoint, usuario, org, space, puerto, flags) van en un
-    JSON legible en %APPDATA%. No son secretos y conviene poder mirarlos.
+Se cifran con la DPAPI de Windows (CryptProtectData), la misma que usa
+Credential Manager por debajo. El cifrado queda atado a la cuenta de Windows:
+el archivo no sirve en otra PC ni para otro usuario. Se usa por ctypes para no
+agregar dependencias al build.
 
-  - Las CONTRASENAS se cifran con la DPAPI de Windows (CryptProtectData), la
-    misma que usa Credential Manager por debajo. El cifrado queda atado a la
-    cuenta de Windows: el archivo no sirve en otra PC ni para otro usuario.
-    Se usa por ctypes para no agregar dependencias al build.
-
-La contrasena NUNCA se escribe en el JSON ni se pasa por linea de comandos de
-forma que quede en el historial: va como argumento a `cf login`, que es la
-unica manera que el CLI acepta.
+La contrasena NUNCA se escribe en el JSON ni en una linea de comandos: va por
+stdin a `cf-proxy login --password-stdin`, que la pasa a `cf auth` por
+variable de entorno.
 """
 import ctypes
 import ctypes.wintypes
@@ -22,7 +22,6 @@ import os
 from pathlib import Path
 
 APP_DIR = Path(os.environ.get("APPDATA", Path.home())) / "cf-proxy-launcher"
-PROFILES_FILE = APP_DIR / "profiles.json"
 SECRETS_FILE = APP_DIR / "secrets.bin"
 
 
@@ -66,39 +65,6 @@ def _unprotect(data: bytes) -> bytes:
 
 
 # ---------------------------------------------------------------------------
-# Perfiles (JSON plano, sin secretos)
-# ---------------------------------------------------------------------------
-DEFAULT_PROFILE = {
-    "name": "",
-    "api": "https://api.cf.us10.hana.ondemand.com",
-    "user": "",
-    "auth": "password",   # "password" | "sso"
-    "org": "",
-    "space": "",
-    "port": 3100,
-    "tunnel": False,
-    "login": False,
-    "create_keys": False,
-    "open_browser": True,
-}
-
-
-def load_profiles() -> list:
-    """Lista de perfiles guardados. Devuelve [] si no hay nada todavia."""
-    try:
-        data = json.loads(PROFILES_FILE.read_text(encoding="utf-8"))
-        return [{**DEFAULT_PROFILE, **p} for p in data.get("profiles", [])]
-    except (OSError, ValueError):
-        return []
-
-
-def save_profiles(profiles: list) -> None:
-    APP_DIR.mkdir(parents=True, exist_ok=True)
-    PROFILES_FILE.write_text(
-        json.dumps({"profiles": profiles}, indent=2, ensure_ascii=False), encoding="utf-8")
-
-
-# ---------------------------------------------------------------------------
 # Contrasenas (cifradas, una por perfil)
 # ---------------------------------------------------------------------------
 def _load_secrets() -> dict:
@@ -126,9 +92,3 @@ def set_password(profile_name: str, password: str) -> None:
     else:
         secrets.pop(profile_name, None)
     _save_secrets(secrets)
-
-
-def forget_profile(profile_name: str) -> None:
-    """Saca el perfil y su contrasena."""
-    save_profiles([p for p in load_profiles() if p["name"] != profile_name])
-    set_password(profile_name, "")

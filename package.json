@@ -4,14 +4,16 @@
   "private": true,
   "description": "Proxy local hacia destinations de BTP usando los servicios de Cloud Foundry ya existentes. Sin cookies, sin BAS, sin configuracion previa.",
   "main": "server.js",
-  "scripts": {
-    "start": "node server.js",
-    "test": "node test/destinations.test.js && node test/proxy-write.test.js",
-    "list": "node server.js --list",
-    "login": "node server.js --login",
-    "setup": "node server.js --create-keys",
-    "deploy": "mbt build -t mta_archives && cf deploy mta_archives/cf-dest_1.0.0.mtar -f",
-    "undeploy": "cf undeploy cf-dest --delete-services --delete-service-keys -f"
+  "bin": {
+    "cf-proxy": "bin/cf-proxy.js"
   },
-  "engines": { "node": ">=16" }
+  "scripts": {
+    "start": "node bin/cf-proxy.js start",
+    "ps": "node bin/cf-proxy.js ps",
+    "test": "node test/destinations.test.js && node test/proxy-write.test.js && node test/profiles.test.js && node test/runs.test.js && node test/cf-home.test.js && node test/cli-runs.test.js",
+    "build:mta": "mbt build -t mta_archives"
+  },
+  "engines": {
+    "node": ">=16"
+  }
 }

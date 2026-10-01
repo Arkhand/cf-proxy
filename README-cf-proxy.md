@@ -7,9 +7,10 @@ de Cloud Foundry. Sin cookies, sin BAS, sin `.env`.
 http://localhost:3100/<NOMBRE_DESTINATION>/<path>
 ```
 
-No hay nada hardcodeado: org, space, instancias de servicio, service keys, apps
-y destinations se descubren en runtime. La misma carpeta sirve en cualquier
-subaccount donde tengas sesión de `cf`.
+No hay nada hardcodeado: instancias de servicio, service keys, apps y
+destinations se descubren en runtime. Lo único que se guarda es el **perfil**:
+una subcuenta de cliente (api, org, space), su puerto y su propia sesión de
+`cf`.
 
 ---
 
@@ -30,10 +31,12 @@ a mano cada vez.
 
 ## 2. Cómo funciona
 
-Seis pasos, todos automáticos y visibles en la consola:
+Siete pasos, todos automáticos y visibles en la consola (o en
+`cf-proxy logs <perfil>`):
 
 ```
-[1/6] cf target                   -> ¿hay sesión? ¿qué org/space?
+[0]   perfil + lock + puerto      -> ¿existe el perfil? ¿ya corre? ¿el puerto está libre?
+[1/6] cf target                   -> ¿hay sesión EN EL PERFIL? apunta a su org/space
 [2/6] cf curl /v3/service_instances
                                   -> ¿qué instancias hay? ¿están las propias (cf-dest-*)?
 [3/6] cf service-keys / service-key
@@ -55,32 +58,65 @@ Por cada request:
 
 | Archivo | Responsabilidad |
 |---|---|
-| [`lib/cf.js`](lib/cf.js) | Único módulo que ejecuta `cf`. Devuelve datos normalizados. |
+| [`lib/profiles.js`](lib/profiles.js) | Perfiles: una subcuenta = un perfil, puertos únicos. |
+| [`lib/runs.js`](lib/runs.js) | Registro de corridas y lock por perfil (`~/.cf-proxy/runs`). |
+| [`bin/cf-proxy.js`](bin/cf-proxy.js) | La consola: perfiles, login, start/stop/ps/logs, `cf` del perfil. |
+| [`lib/cf.js`](lib/cf.js) | Único módulo que ejecuta `cf`, siempre con el CF_HOME del perfil. |
 | [`lib/discover.js`](lib/discover.js) | Busca instancias y keys. Las propias (`cf-dest-*`) primero. |
 | [`lib/auth.js`](lib/auth.js) | Login de usuario (authorization_code) y cache de tokens. |
 | [`lib/destinations.js`](lib/destinations.js) | Tokens XSUAA + listar/resolver destinations, con cache. |
 | [`lib/proxy.js`](lib/proxy.js) | El servidor HTTP: ruteo, auth, on-premise, login, página. |
-| [`server.js`](server.js) | Orquesta los 6 pasos y parsea los flags. |
+| [`server.js`](server.js) | Orquesta los pasos de una corrida. |
 | [`mta.yaml`](mta.yaml) | Recursos propios en CF: xsuaa, destination, connectivity, app SSH. |
 | [`webapp/index.html`](webapp/index.html) | Página de diagnóstico (UI5). |
 
-Sin dependencias: solo Node ≥ 16 y el `cf` CLI en el PATH. Para `npm run
-deploy` hace falta además `mbt` y el plugin `multiapps` de `cf`.
+Sin dependencias: solo Node ≥ 16 y el `cf` CLI en el PATH. Para desplegar el
+MTA hace falta además `mbt` (o el `.mtar` del launcher) y el plugin `multiapps`
+de `cf`.
 
 ## 3. Uso
 
 ```bash
-cf login -a https://api.cf.<region>.hana.ondemand.com --sso
-cf target -o <org> -s <space>
-
 cd cf-proxy
-npm run deploy    # una vez por space: crea los recursos cf-dest-* (ver §5)
-npm run list      # ver qué destinations hay y cuáles van a funcionar
-npm start         # levantar el proxy en localhost:3100 (abre la página)
+# una vez por cliente: el perfil (puerto libre si no se indica) y su login
+node bin/cf-proxy.js profiles add --name acme --title "ACME" \
+     --api https://api.cf.<region>.hana.ondemand.com --org <org> --space <space> --auth sso
+node bin/cf-proxy.js login acme
+
+# una vez por space: los recursos cf-dest-* (ver §5)
+npm run build:mta
+node bin/cf-proxy.js cf acme -- deploy mta_archives/cf-dest_1.0.0.mtar -f
+
+node bin/cf-proxy.js start acme      # en segundo plano; devuelve la URL
+node bin/cf-proxy.js ps              # qué corre: título, usuario, org/space, puerto, estado
+node bin/cf-proxy.js logs acme -f    # la salida de la corrida
+node bin/cf-proxy.js stop acme
 ```
 
-Sin `npm run deploy` también funciona: reutiliza las instancias que ya haya en
-el space. Lo único que no va a funcionar sin el deploy es PrincipalPropagation.
+Sin el deploy también funciona: reutiliza las instancias que ya haya en el
+space. Lo único que no va a funcionar sin el deploy es PrincipalPropagation.
+
+### Perfiles, sesiones y corridas
+
+- **Una subcuenta = un perfil.** `(api, org)` no se repite entre perfiles, y el
+  **puerto tampoco**. Un perfil que choca (p.ej. importado del launcher viejo,
+  todos en 3100) queda marcado y no arranca hasta corregirlo:
+  `profiles edit <p> --port auto`.
+- **Cada perfil tiene su CF_HOME** (`~/.cf-proxy/profiles/<p>/cf-home`). El
+  proxy nunca usa ni cambia la sesión global de `cf`: tu terminal sigue
+  apuntando donde estaba, y dos clientes pueden correr a la vez. Los plugins
+  (`multiapps`) se siguen leyendo de `~/.cf` vía `CF_PLUGIN_HOME`.
+- **Una corrida por perfil.** `start` de un perfil que ya corre devuelve su URL
+  (`already: true`) en vez de levantar otro. Sirve para que dos sesiones de IA
+  pidan el mismo cliente sin pisarse. Dos `start` simultáneos terminan en un
+  solo proceso: el registro (`~/.cf-proxy/runs/<p>.json`) es también el lock.
+- **`cf <p> -- <args>`** corre cualquier comando de `cf` con la sesión del
+  perfil e imprime antes `[cf-proxy] perfil X -> api / org / space`. Se niega a
+  apuntar a otro org: el deploy al cliente equivocado no se puede repetir por
+  acá.
+- `--json` en cualquier comando imprime un solo objeto (`{ok, ...}`); es lo que
+  usan el launcher y las skills. Códigos de salida: 2 uso, 3 ya corre, 4 sin
+  sesión, 5 puerto ocupado, 6 faltan recursos en el space.
 
 En el `ui5.yaml` del proyecto:
 
@@ -90,18 +126,22 @@ En el `ui5.yaml` del proyecto:
   url: http://localhost:3100
 ```
 
-### Flags
+### Flags de `server.js`
+
+`server.js` es lo que `start` lanza en segundo plano. Se puede correr en primer
+plano con `node server.js --profile <p>`. Puerto y flags (`tunnel`, `login`,
+`create_keys`, `open_browser`) salen del perfil; estos flags los suman:
 
 | Flag | Qué hace |
 |---|---|
+| `--profile <p>` | **Obligatorio.** Sin él, sale con código 2 y lista los perfiles. |
 | `--list` | Lista las destinations agrupadas por si van a funcionar o no, y sale. |
 | `--login` | Arranca y abre el login de usuario en el browser. |
-| `--port <n>` | Puerto local. Default `3100`. Si se cambia, ver §6. |
 | `--xsuaa <instancia>` | Usar otra instancia de xsuaa para el login (default `cf-dest-xsuaa`). |
 | `--create-keys` | Permite crear una service key (`cf-dest-key`) en instancias ajenas si ninguna sirve. |
 | `--tunnel` | Fuerza el túnel `cf ssh -L`. Es automático si existe `cf-dest-app`. |
 | `--tunnel-app <app>` | App a usar para el túnel. |
-| `--tunnel-port <n>` | Puerto local del túnel. Default `20003`. |
+| `--tunnel-port <n>` | Puerto local del túnel. Default: uno libre (dos proxies no pueden compartirlo). |
 | `--connectivity-proxy host:port` | Usar un Connectivity Proxy que ya sea alcanzable. |
 | `--no-open` | No abrir la página de diagnóstico al arrancar. |
 
@@ -173,12 +213,15 @@ Detalles de comportamiento:
   escribe. Además el body debe ser `application/json`, lo que fuerza preflight
   CORS y bloquea escrituras desde páginas de otro origen.
 
-### Cambiar de org/space sin reiniciar
+### Cambiar de space sin reiniciar
 
-El botón **Cambiar** al lado de *Target CF* lista los orgs y spaces a los que
-tenés acceso y reapunta el CLI (`cf target -o -s`) sin cortar el proxy: se
-rehace el descubrimiento de servicios, se reabre el túnel y la tabla pasa a
-mostrar las destinations del nuevo subaccount. No modifica nada en BTP.
+El botón **Cambiar** al lado de *Target CF* lista los spaces del org del perfil
+y reapunta la sesión **del perfil** (`cf target -s`) sin cortar el proxy: se
+rehace el descubrimiento de servicios y se reabre el túnel. No modifica nada en
+BTP, ni el target de la terminal ni el de otros proxies.
+
+El org queda fijo: un perfil es una subcuenta. `POST /__target` con otro org
+responde **409**; para otro cliente, otro perfil.
 
 Si el nuevo space no tiene una instancia de `destination` usable, el cambio se
 revierte y el target vuelve a donde estaba: nunca queda a medias.
@@ -244,7 +287,7 @@ curl -X PUT http://localhost:3100/__destinations/MI_API \
 | `OAuth2UserTokenExchange` / `OAuth2JWTBearer` | ✅ con sesión de usuario | ✅ con sesión + túnel |
 | `PrincipalPropagation` | — | ⚠️ implementado; ver §6 |
 
-`npm run list` te lo dice por destination, sin adivinar.
+`node server.js --profile <p> --list` te lo dice por destination, sin adivinar.
 
 Verificado el 2026-09-04 en `bms-bld/BLD`: Basic on-prem
 (`S4_BASIC_ZSB_WFTASK_UI2/$metadata`) devuelve `200` desde el S/4 por el
@@ -253,7 +296,8 @@ túnel. El proxy manda siempre el header `sap-client` de la destination: sin
 
 ## 5. Los recursos propios (`mta.yaml`)
 
-`npm run deploy` despliega, una vez por space, cuatro cosas con nombre fijo:
+`cf-proxy cf <p> -- deploy mta_archives/cf-dest_1.0.0.mtar -f` despliega, una
+vez por space, cuatro cosas con nombre fijo:
 
 | Nombre | Qué es | Para qué |
 |---|---|---|
@@ -266,7 +310,8 @@ Las tres instancias vienen con una service key `cf-dest-key`. Si `cf-proxy`
 las encuentra, las usa directo y no revisa nada más del space.
 
 Nada del subaccount se modifica: ni destinations, ni otras apps, ni sus XSUAA.
-`npm run undeploy` borra todo (app, instancias y keys).
+`cf-proxy cf <p> -- undeploy cf-dest --delete-services --delete-service-keys -f`
+borra todo (app, instancias y keys).
 
 Requisitos para desplegar: rol `SpaceDeveloper`, cuota para tres instancias y
 128 MB de memoria, y SSH permitido en el space (`cf space-ssh-allowed <space>`).
@@ -297,9 +342,11 @@ browser ──► /__login ──► XSUAA /oauth/authorize ──► IdP (SSO) 
 - Con sesión, cada request a una `S4_PP_*` lleva
   `SAP-Connectivity-Authentication: Bearer <JWT>` por el túnel, y el S/4
   registra la llamada con **tu** usuario (no con uno técnico).
-- El `redirect_uri` es `http://localhost:3100/__callback`. Si se cambia el
-  puerto con `--port`, hay que agregar el nuevo puerto en
-  [`xs-security.json`](xs-security.json) y volver a desplegar.
+- El `redirect_uri` es `http://localhost:<puerto del perfil>/__callback`. Si el
+  puerto no está en las `redirect-uris` de [`xs-security.json`](xs-security.json),
+  el paso 4 lo avisa y el login falla con `invalid_redirect`: hay que agregarlo
+  y actualizar el XSUAA de **esa** subcuenta
+  (`cf-proxy cf <p> -- update-service cf-dest-xsuaa -c xs-security.json`).
 
 ### Estado actual: llega al S/4, pero recibe 401
 
@@ -343,7 +390,7 @@ El proxy lo resuelve con un port-forward SSH a través de una app del space:
 PC                                       Cloud Foundry
 ────────────────────────────             ──────────────────────────────────
 
-cf-proxy ──► localhost:20003 ──ssh──► cf-dest-app ──► connectivityproxy:20003
+cf-proxy ──► localhost:<libre> ──ssh──► cf-dest-app ──► connectivityproxy:20003
                                                               │
                                                               ▼
                                                        Cloud Connector
@@ -354,7 +401,9 @@ cf-proxy ──► localhost:20003 ──ssh──► cf-dest-app ──► conn
 
 Si existe `cf-dest-app` (del deploy), el túnel se abre solo. Si no, con
 `--tunnel` se busca cualquier app `STARTED` con SSH habilitado, o se indica
-una con `--tunnel-app`. El túnel se cierra al cortar el proxy con Ctrl+C.
+una con `--tunnel-app`. El puerto local es uno libre por corrida, así que
+varios proxies pueden tener túnel a la vez. El túnel se cierra con el proxy
+(`stop` mata el árbol completo, incluido el `cf ssh`).
 
 ## 8. Límites
 
@@ -372,13 +421,17 @@ una con `--tunnel-app`. El túnel se cierra al cortar el proxy con Ctrl+C.
 
 | Síntoma | Causa | Solución |
 |---|---|---|
-| `No hay sesion de CF activa` | Token de `cf` vencido | `cf login --sso` |
-| `Ninguna instancia de destination tiene una key usable` | Solo hay keys tipo `content` | `npm run deploy` o `npm run setup` |
-| `401 PrincipalPropagation necesita el JWT del usuario` | Sin sesión | Abrir `/__login` o `npm run login` |
-| `501 No hay un XSUAA propio` | No se hizo el deploy | `npm run deploy` |
-| `501 ... requiere el Connectivity Proxy` | Destination on-prem sin túnel | `npm run deploy` (túnel automático) o `--tunnel` |
-| `Ninguna app STARTED tiene SSH habilitado` | Sin `cf-dest-app` ni otra con SSH | `npm run deploy` o `cf enable-ssh <app> && cf restart <app>` |
-| Login vuelve con `invalid_redirect` | Puerto distinto de 3100 | Agregar el puerto en `xs-security.json` y redesplegar |
+| `Falta --profile` | Se corrió `server.js` sin perfil | `cf-proxy start <perfil>` |
+| `El perfil X no tiene sesion de CF` | Primera vez, o el token de `cf` del perfil venció | `cf-proxy login <perfil>` |
+| `El perfil X ya esta corriendo` | Ya hay una corrida de ese perfil | `cf-proxy ps` / `cf-proxy stop <perfil>` |
+| `el puerto N lo usa Y` | Dos perfiles con el mismo puerto | `cf-proxy profiles edit <perfil> --port auto` |
+| `Ninguna instancia de destination tiene una key usable` | Solo hay keys tipo `content` | Desplegar el MTA (§5) o `profiles edit <p> --create-keys` |
+| `401 PrincipalPropagation necesita el JWT del usuario` | Sin sesión de usuario | Abrir `/__login` |
+| `501 No hay un XSUAA propio` | No se hizo el deploy | Desplegar el MTA (§5) |
+| `501 ... requiere el Connectivity Proxy` | Destination on-prem sin túnel | Desplegar el MTA (túnel automático) o `profiles edit <p> --tunnel` |
+| `Ninguna app STARTED tiene SSH habilitado` | Sin `cf-dest-app` ni otra con SSH | Desplegar el MTA o `cf-proxy cf <p> -- enable-ssh <app>` + restart |
+| Login vuelve con `invalid_redirect` | El puerto del perfil no está en `xs-security.json` | Agregarlo y `update-service` del XSUAA (§6) |
+| `Insufficient scope for this resource` en una `OAuth2UserTokenExchange` | El JWT del login no trae `uaa.user` | `update-service` con el `xs-security.json` actual y volver a entrar por `/__login` |
 | `403 Access denied to resource ... cloud connector` | El path no está expuesto en el CC | Revisar la URL: la destination ya incluye su base path |
 | `401` del S/4 con `WWW-Authenticate: Basic` en una PP | El CC no propagó o el S/4 no mapeó | Ver §6, "Estado actual" |
 | Página ICM "Anmeldung fehlgeschlagen" en una Basic | Mandante equivocado o credenciales vencidas | Ver `sap-client` en Detalles; probar el usuario de la destination |

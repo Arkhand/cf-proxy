@@ -24,10 +24,19 @@ destinations.
 **Why:** el error es facil de repetir (el target de CF es global y silencioso)
 y el sintoma no aparece hasta que alguien mira el cockpit del cliente.
 
+**Que cambio (2026-10-01):** cf-proxy ya no usa el `cf` global. Cada perfil
+(una subcuenta) tiene su CF_HOME en `~/.cf-proxy/profiles/<p>/cf-home`, el org
+queda fijo por perfil (la pagina solo cambia de space; otro org da 409) y el
+deploy se hace con `node bin/cf-proxy.js cf <p> -- deploy ...`, que se niega a
+apuntar a otro org. `npm run deploy/undeploy` (que usaban el `cf` global) se
+sacaron a proposito.
+
 **How to apply:**
 
-- Antes de deployar o de escribir una destination, mirar el org/space. La
-  pagina lo muestra en "Target CF" y `/__health` lo expone en `target`.
+- Deployar SIEMPRE por el wrapper del perfil (`cf-proxy cf <p> -- ...`), nunca
+  con `cf` suelto. Mirar el banner `[cf-proxy] perfil X -> api / org / space`.
+- Antes de escribir una destination, mirar el org/space. La pagina lo muestra
+  en "Target CF" y `/__health` lo expone en `target` (y `profile`).
 - Para revertir un deploy al lugar equivocado: `cf undeploy <mta>
   --delete-services` **y ademas** borrar a mano las destinations que el MTA
   escribio a nivel subaccount.
