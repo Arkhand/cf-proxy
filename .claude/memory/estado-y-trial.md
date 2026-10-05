@@ -72,3 +72,10 @@ de cf es por (api, usuario) en `~/.cf-target/sessions/`; cada comando y cada pro
 una copia privada. `profiles.load()` migra solas las sesiones viejas de
 `~/.cf-proxy/profiles/<p>/cf-home`. El launcher guarda contraseñas en el Credential
 Manager (`cf-target:<api>:<usuario>`) y migra `secrets.bin` al abrirse.
+
+**Redirect-uris con comodin de puerto (2026-10-05).** XSUAA acepta
+`http://localhost:*/**` (probado en la trial: login de usuario volviendo al 3101). Ya no
+hay que declarar puertos. Aplicado con `update-service` del `cf-dest-xsuaa` en las cuatro
+subcuentas configuradas (trial, etp-shared-lab, BMS-BLD, eBay); el .mtar del repo ya lo
+trae. Ojo: XSUAA valida el redirect_uri recien despues de autenticar, asi que un curl al
+/oauth/authorize no prueba nada (siempre 302 al login): hay que hacer un login real.
