@@ -42,6 +42,16 @@ def find_proxy_dir():
     return None
 
 
+def find_icon():
+    """
+    El .ico de la ventana. Empaquetado viaja DENTRO del .exe (PyInstaller lo
+    extrae en sys._MEIPASS); en desarrollo esta en launcher/. None si no esta.
+    """
+    folder = Path(getattr(sys, "_MEIPASS", Path(__file__).resolve().parents[1]))
+    icon = folder / "cf-proxy.ico"
+    return icon if icon.is_file() else None
+
+
 def find_mtar():
     """El .mtar pre-buildeado para desplegar los recursos. None si no esta."""
     for folder in [base_dir() / "recursos", base_dir(), base_dir() / "mta_archives"]:
