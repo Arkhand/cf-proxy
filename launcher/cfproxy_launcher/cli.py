@@ -82,6 +82,26 @@ class Cli:
     def ps(self) -> dict:
         return self.call(["ps"], timeout=30)
 
+    # --- Tuneles a servicios (p.ej. PostgreSQL) ---------------------------------
+    def tunnels(self) -> dict:
+        return self.call(["tunnels", "list"])
+
+    def save_tunnel(self, tunnel: dict, editing: bool) -> dict:
+        """Alta (`add`) o edicion (`edit`). El puerto vacio va como `auto`."""
+        args = ["tunnels", "edit", tunnel["name"]] if editing else ["tunnels", "add", "--name", tunnel["name"]]
+        args += ["--profile", tunnel["profile"], "--service", tunnel["service"],
+                 "--port", str(tunnel["port"]), "--app", tunnel["app"]]
+        return self.call(args)
+
+    def remove_tunnel(self, name: str) -> dict:
+        return self.call(["tunnels", "remove", name])
+
+    def start_tunnel(self, name: str) -> dict:
+        return self.call(["tunnels", "start", name, "--origin", "ui"], timeout=240)
+
+    def stop_tunnel(self, name: str) -> dict:
+        return self.call(["tunnels", "stop", name])
+
     def run_cf(self, name: str, cf_args: list, on_line) -> bool:
         """
         `cf` con la sesion del perfil (p.ej. el deploy del .mtar), mostrando

@@ -73,6 +73,15 @@ una copia privada. `profiles.load()` migra solas las sesiones viejas de
 `~/.cf-proxy/profiles/<p>/cf-home`. El launcher guarda contraseñas en el Credential
 Manager (`cf-target:<api>:<usuario>`) y migra `secrets.bin` al abrirse.
 
+**Tuneles a servicios (2026-10-13).** `cf-proxy tunnels add|start|stop|logs` + `tunnel.js`: túnel
+`cf ssh` a una instancia (pensado para PostgreSQL de BTP), config aparte en `~/.cf-proxy/tunnels.json`,
+corrida en `runs/@<túnel>.json`, puertos desde 15432. El host se lee de los bindings existentes por
+`/v3/service_credential_bindings/<guid>/details` (no crea keys). Probado en eBay: `cf-dest-app` llega
+al Postgres del space aunque no esté bindeada (los ASG son por space). El launcher (Python) los muestra
+en su propio cuadro. `lib/sshtunnel.js` es el código de túnel compartido con server.js.
+Ojo al probar `cf curl` desde Git Bash: convierte `/v3/...` en ruta de Windows sin
+`MSYS_NO_PATHCONV=1` (da `CF-NotFound` y parece un error de la API).
+
 **Redirect-uris con comodin de puerto (2026-10-05).** XSUAA acepta
 `http://localhost:*/**` (probado en la trial: login de usuario volviendo al 3101). Ya no
 hay que declarar puertos. Aplicado con `update-service` del `cf-dest-xsuaa` en las cuatro
