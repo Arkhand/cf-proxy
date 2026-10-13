@@ -94,7 +94,9 @@ Para armar el paquete hace falta PyInstaller (`launcher/requirements-build.txt`)
 | `cli.py` | Todo lo demás: llama a `node bin/cf-proxy.js ... --json` |
 | `paths.py` | Dónde está cada cosa, empaquetado o en el repo |
 | `app.py` | La ventana (tkinter) |
+| `theme.py` | Estilos ttk (`clam`), DPI awareness y los puntos de estado. Sin paquetes extra |
 | `run_launcher.py` | Entry point de PyInstaller (import absoluto) |
+| `cf-proxy.ico` | Icono del `.exe` y de la ventana. Se redibuja con `make_icon.py` (necesita Pillow; buildear no) |
 
 ### Dos detalles que no son obvios
 

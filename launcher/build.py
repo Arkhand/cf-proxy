@@ -18,6 +18,7 @@ Requisitos para BUILDEAR (no para usar): Python 3 y PyInstaller
 mta_archives/ (esta versionado); si no esta, se corre `mbt build`.
 """
 import importlib.util
+import os
 import shutil
 import subprocess
 import sys
@@ -32,11 +33,13 @@ DIST = ROOT / "dist" / "cf-proxy-launcher"
 # mta_archives, .env, node_modules ni el historial de git.
 # xs-security.json: el proxy lo lee para avisar si el puerto del perfil no
 # esta en las redirect-uris del XSUAA.
-PROXY_FILES = ["server.js", "package.json", "README.md", "xs-security.json"]
+PROXY_FILES = ["server.js", "tunnel.js", "package.json", "README.md", "xs-security.json"]
 PROXY_DIRS = ["bin", "lib", "webapp"]
 
 # La guia para el que recibe el paquete. Se edita en launcher/LEEME.md.
 LEEME = ROOT / "LEEME.md"
+# Versionado; se redibuja con launcher/make_icon.py.
+ICON = ROOT / "cf-proxy.ico"
 
 
 def run(args, cwd=None):
@@ -58,6 +61,24 @@ def find_mtar():
     return found[0] if found else None
 
 
+def clear(folder: Path):
+    """
+    Vacia la carpeta del paquete anterior. Las carpetas que no se pueden borrar
+    se dejan vacias: un proxy lanzado desde el paquete corre con
+    recursos/cf-proxy como directorio de trabajo, y Windows no deja borrar esa
+    carpeta mientras el proceso vive (los archivos de adentro, si).
+    """
+    for child in folder.iterdir():
+        if child.is_dir():
+            clear(child)
+            try:
+                child.rmdir()
+            except OSError:
+                pass  # en uso como directorio de trabajo: queda vacia y se vuelve a llenar
+        else:
+            child.unlink()
+
+
 def main():
     # Antes de borrar el dist anterior: sin PyInstaller no hay con que rearmarlo.
     if importlib.util.find_spec("PyInstaller") is None:
@@ -74,15 +95,18 @@ def main():
             print(f"{exe} esta abierto. Cerrar la ventana de cf-proxy y volver a correr: npm run dist")
             return 1
     if DIST.exists():
-        shutil.rmtree(DIST)
+        clear(DIST)
     recursos = DIST / "recursos"
-    (recursos / "cf-proxy").mkdir(parents=True)
+    (recursos / "cf-proxy").mkdir(parents=True, exist_ok=True)
 
     # 1. El .exe
     print("\n== PyInstaller ==")
+    # --icon: el del .exe (y del acceso directo). --add-data: el mismo, para la
+    # ventana; PyInstaller lo extrae junto al codigo (paths.find_icon).
     ok = run([
         sys.executable, "-m", "PyInstaller",
         "--onefile", "--windowed", "--name", "cf-proxy",
+        "--icon", str(ICON), "--add-data", f"{ICON}{os.pathsep}.",
         "--distpath", str(DIST),
         "--workpath", str(ROOT / "build"),
         "--specpath", str(ROOT / "build"),
@@ -97,7 +121,7 @@ def main():
     for name in PROXY_FILES:
         shutil.copy2(PROXY / name, recursos / "cf-proxy" / name)
     for name in PROXY_DIRS:
-        shutil.copytree(PROXY / name, recursos / "cf-proxy" / name)
+        shutil.copytree(PROXY / name, recursos / "cf-proxy" / name, dirs_exist_ok=True)
     print(f"  {len(PROXY_FILES)} archivos + {len(PROXY_DIRS)} carpetas")
 
     # 3. El .mtar pre-buildeado

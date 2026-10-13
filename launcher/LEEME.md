@@ -126,6 +126,15 @@ sola.
 > node bin\cf-proxy.js cf <perfil> -- update-service cf-dest-xsuaa -c xs-security.json
 > ```
 
+### Túneles a una base (PostgreSQL)
+
+Para correr una app local contra una base de BTP (por ejemplo, un CAP en modo
+hybrid), usá el cuadro **Túneles**. Con **Nuevo**, elegís el perfil, el nombre
+de la instancia de la base en el space y el puerto local (vacío = el siguiente
+libre desde 15432). Con **Iniciar**, queda `localhost:<puerto>` apuntando a la
+base. El host lo toma solo de la instancia. Usuario y contraseña siguen siendo
+los de la base: el túnel solo los lleva.
+
 ## 6. Cerrar la ventana
 
 La ventana es solo una consola de administración: los proxies corren aparte.

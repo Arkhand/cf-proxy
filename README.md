@@ -27,7 +27,8 @@ http://localhost:3100/<NOMBRE_DESTINATION>/<path>
 |---|---|
 | `npm run launcher` | Abre la ventana (perfiles + una pestaña por proxy) desde el código |
 | `npm start -- <perfil>` | Arranca el proxy de un perfil en segundo plano |
-| `npm run ps` | Qué proxies corren, en qué puerto y con qué estado |
+| `npm run ps` | Qué proxies y túneles corren, en qué puerto y con qué estado |
+| `node bin/cf-proxy.js tunnels start <t>` | Túnel local a un servicio del space (p.ej. PostgreSQL); ver [§7](README-cf-proxy.md#túneles-a-servicios-postgresql-y-otros) |
 | `npm test` | Tests (servicios y `cf` falsos; no tocan BTP) |
 | `npm run dist` | Arma el paquete para compartir (ver abajo) |
 | `npm run build:mta` | Rearma `mta_archives/cf-dest_1.0.0.mtar` (hace falta `mbt`) |
@@ -63,6 +64,7 @@ entera** y pasarla. `launcher/dist/` no se versiona.
 | Carpeta | Qué es |
 |---|---|
 | `server.js`, `lib/` | El proxy: perfiles, descubrimiento, credenciales, túnel, ruteo |
+| `tunnel.js` | Túnel a un servicio del space (lo arranca `tunnels start`) |
 | `bin/cf-proxy.js` | La consola: perfiles, login, start/stop/ps/logs y `cf` con la sesión del perfil |
 | `webapp/` | La página (UI5, un solo HTML, sin build) |
 | `test/` | Tests contra servicios y un `cf` falsos; no tocan BTP |

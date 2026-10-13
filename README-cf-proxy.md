@@ -411,6 +411,45 @@ una con `--tunnel-app`. El puerto local es uno libre por corrida, así que
 varios proxies pueden tener túnel a la vez. El túnel se cierra con el proxy
 (`stop` mata el árbol completo, incluido el `cf ssh`).
 
+### Túneles a servicios (PostgreSQL y otros)
+
+El mismo truco sirve para cualquier servicio que solo se alcanza desde adentro
+de CF, como un PostgreSQL de BTP. Para correr una app local contra la base (CAP
+en modo hybrid, un cliente SQL), cf-proxy deja `localhost:<puerto>` apuntando al
+host interno de la instancia:
+
+```
+app local ──► localhost:15432 ──ssh──► cf-dest-app ──► 10.x.x.x:5432 (PostgreSQL)
+```
+
+Cada túnel se guarda aparte de los perfiles, en `~/.cf-proxy/tunnels.json`: su
+nombre, el perfil (la subcuenta), la instancia de servicio y el puerto local. El
+puerto es fijo, para que la app local lo pueda tener configurado, y no se repite
+con otro túnel ni con un perfil. Sin `--port` se toma el primero libre desde
+15432.
+
+```bash
+node bin/cf-proxy.js tunnels add --name eBay-pg --profile eBay --service ebay_pg_workzone_dev
+node bin/cf-proxy.js tunnels start eBay-pg     # segundo plano, idempotente
+node bin/cf-proxy.js ps                        # proxies y túneles
+node bin/cf-proxy.js tunnels logs eBay-pg
+node bin/cf-proxy.js tunnels stop eBay-pg
+```
+
+- **El host no se guarda.** Al arrancar se lee de un binding que ya tenga la
+  instancia (de una app o una service key), por la API v3. Es solo lectura: no
+  crea keys. Si la instancia no tiene ninguno, el error dice cómo crear una key.
+- **La app de salto** es la indicada con `--app`; si no, `cf-dest-app`; si no,
+  cualquier app `STARTED` con SSH. Tiene que estar en el mismo space que la base:
+  los security groups de CF abren la red por space.
+- **Solo lleva bytes.** Usuario, contraseña y certificados siguen siendo los del
+  binding (`cf default-env <app>` o una service key). El TLS de la base anda igual
+  por el túnel.
+- **Si `cf ssh` se corta**, la corrida termina y deja de figurar en `ps`. Se
+  vuelve a levantar con `tunnels start`.
+- La corrida se registra en `runs/@<túnel>.json` (`@` no es válido en un nombre
+  de perfil, así que no chocan).
+
 ## 8. Límites
 
 - **Solo para desarrollo.** El deploy de las apps sigue usando sus propias

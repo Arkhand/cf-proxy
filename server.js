@@ -52,6 +52,7 @@ const { discover, OWN } = require("./lib/discover");
 const { makeDestinationClient, makeTokenProvider } = require("./lib/destinations");
 const { makeAuth } = require("./lib/auth");
 const { createProxyServer, probeTcp } = require("./lib/proxy");
+const sshTunnel = require("./lib/sshtunnel");
 
 const args = process.argv.slice(2);
 const has = (flag) => args.includes(flag);
@@ -180,76 +181,33 @@ function portFree(port) {
 }
 
 /**
- * PASO 5b - Elegir la app por la que abrir el tunel SSH.
- *
- * Orden: la indicada con --tunnel-app; si no, la propia del MTA (cf-dest-app);
- * si no, cualquier app STARTED con SSH habilitado.
- */
-async function pickTunnelApp() {
-	if (TUNNEL_APP) {
-		return TUNNEL_APP;
-	}
-
-	const apps = await cf.listStartedApps();
-
-	if (apps.includes(OWN.sshApp)) {
-		return OWN.sshApp;
-	}
-
-	log("  Sin app propia; buscando una app STARTED con SSH habilitado...");
-	for (const candidate of apps) {
-		if (await cf.isSshEnabled(candidate)) {
-			return candidate;
-		}
-	}
-	return null;
-}
-
-/**
  * PASO 5b - Abrir el tunel SSH hacia el Connectivity Proxy.
  *
- * Levanta `cf ssh -L` a traves de la app elegida y espera a que el puerto
- * local responda.
+ * Levanta `cf ssh -L` a traves de la app elegida (--tunnel-app, cf-dest-app o
+ * una con SSH) y espera a que el puerto local responda. Ver lib/sshtunnel.js.
  */
 async function openTunnel(remoteHost, remotePort) {
-	const appName = await pickTunnelApp();
+	const appName = await sshTunnel.pickApp(TUNNEL_APP, log);
 
 	if (!appName) {
-		return {
-			ok: false,
-			reason:
-				"Ninguna app STARTED del space tiene SSH habilitado.\n" +
-				"     Opciones: cf-proxy cf <perfil> -- deploy <mtar> (despliega cf-dest-app), o habilitarlo en una:\n" +
-				"     cf enable-ssh <app> && cf restart <app>, o indicar una con --tunnel-app <app>."
-		};
+		return { ok: false, reason: sshTunnel.NO_APP_HINT };
 	}
 
 	const localPort = FIXED_TUNNEL_PORT ? Number(FIXED_TUNNEL_PORT) : await freePort();
 	log(`  Abriendo tunel via ${appName}: localhost:${localPort} -> ${remoteHost}:${remotePort}`);
-	tunnelProcess = cf.startTunnel({ appName, localPort, remoteHost, remotePort });
-	if (run) run.update({ tunnelPid: tunnelProcess.pid });
-
-	// Se junta la salida por si el tunel falla, para mostrar el motivo real.
-	let output = "";
-	tunnelProcess.stdout.on("data", (d) => (output += d));
-	tunnelProcess.stderr.on("data", (d) => (output += d));
-
-	// Esperar hasta 30s a que el puerto local acepte conexiones.
-	for (let i = 0; i < 30; i++) {
-		if (tunnelProcess.exitCode !== null) {
-			return { ok: false, reason: `\`cf ssh\` termino solo: ${output.trim().slice(0, 300) || "sin detalle"}` };
+	const opened = await sshTunnel.open({
+		appName, localPort, remoteHost, remotePort,
+		onSpawn: (child) => {
+			tunnelProcess = child;
+			if (run) run.update({ tunnelPid: child.pid });
 		}
+	});
 
-		const probe = await probeTcp("127.0.0.1", localPort, 1000);
-		if (probe.ok) {
-			return { ok: true, appName, localPort };
-		}
-
-		await new Promise((r) => setTimeout(r, 1000));
+	if (!opened.ok) {
+		closeTunnel();
+		return opened;
 	}
-
-	closeTunnel();
-	return { ok: false, reason: `El tunel no respondio en 30s. ${output.trim().slice(0, 300)}` };
+	return { ok: true, appName, localPort };
 }
 
 /**

@@ -27,6 +27,13 @@
  *   ps                                         corridas vivas: titulo, usuario, org/space, puerto, health
  *   status [<p>]                               igual que ps, o una sola
  *   logs <p> [-f]
+ *   tunnels list                               tuneles a servicios del space (p.ej. PostgreSQL)
+ *   tunnels add --name N --profile P --service <instancia> [--port N|auto] [--app A]
+ *   tunnels edit <t> [mismos flags]            (el nombre no se cambia)
+ *   tunnels remove <t>
+ *   tunnels start <t> [--timeout 180]          localhost:<puerto> -> host del servicio (idempotente)
+ *   tunnels stop <t>
+ *   tunnels logs <t> [-f]
  *   cf <p> -- <args de cf>                     `cf` con la sesion del perfil (deploy, undeploy...)
  */
 const fs = require("fs");
@@ -37,6 +44,7 @@ const profiles = require("../lib/profiles");
 const runs = require("../lib/runs");
 const sessions = require("../lib/sessions");
 const targetfile = require("../lib/targetfile");
+const tunnels = require("../lib/tunnels");
 
 /**
  * cf de este comando en una copia privada de la sesion del perfil. Al salir
@@ -58,6 +66,7 @@ function useSession(p, { replace = false } = {}) {
 }
 
 const SERVER = process.env.CF_PROXY_SERVER || path.join(__dirname, "..", "server.js");
+const TUNNEL_SCRIPT = process.env.CF_PROXY_TUNNEL || path.join(__dirname, "..", "tunnel.js");
 const { EXIT } = runs;
 
 // ============================================================================
@@ -276,11 +285,16 @@ async function cmdTargets() {
 // ============================================================================
 // start / stop
 // ============================================================================
+/** La corrida registrada esta lista: escuchando y respondiendo. */
+async function isReady(record) {
+	return Boolean(record && record.state === "listening" && (await runs.status(record)).status === "ok");
+}
+
 /** Espera a que la corrida registrada responda. null si no llega a tiempo. */
 async function waitHealthy(name, deadline) {
 	while (Date.now() < deadline) {
 		const record = runs.read(name);
-		if (record && record.state === "listening" && (await runs.health(record))) {
+		if (await isReady(record)) {
 			return record;
 		}
 		await sleep(500);
@@ -288,32 +302,29 @@ async function waitHealthy(name, deadline) {
 	return null;
 }
 
-async function cmdStart() {
-	const p = requireProfile(positional[1], true);
+/**
+ * Arranca `script` en segundo plano y espera a que su corrida (`runName`) este
+ * lista. Idempotente: si ya corre, devuelve esa. Lo usan el proxy y los tuneles.
+ * `stopHint`: como detenerla, para el mensaje de un proceso vivo que no responde.
+ * Devuelve {record, already} o corta con die().
+ */
+async function launchBackground({ runName, script, scriptArgs, label, stopHint, logsHint }) {
 	const deadline = Date.now() + Number(flags.timeout || 180) * 1000;
-	const result = (record, already) => done(
-		{ already, profile: p.name, url: record.url, port: record.port, pid: record.pid, log: record.log },
-		() => console.log(`${already ? "Ya estaba corriendo" : "OK"}  ${p.title}: ${record.url}  (pid ${record.pid})`)
-	);
 
-	// Idempotente: si ya corre, se devuelve esa corrida.
-	const existing = runs.read(p.name);
+	const existing = runs.read(runName);
 	if (existing && runs.isAlive(existing)) {
-		const healthy = await waitHealthy(p.name, deadline);
-		if (healthy) return result(healthy, true);
-		die(EXIT.BUSY, `El perfil ${p.name} tiene un proceso vivo (pid ${existing.pid}) que no responde.`,
-			{ hint: `Detenerlo: cf-proxy stop ${p.name}`, tail: tailLines(runs.logFile(p.name)) });
+		const healthy = await waitHealthy(runName, deadline);
+		if (healthy) return { record: healthy, already: true };
+		die(EXIT.BUSY, `${label} tiene un proceso vivo (pid ${existing.pid}) que no responde.`,
+			{ hint: `Detenerlo: ${stopHint}`, tail: tailLines(runs.logFile(runName)) });
 	}
 
 	// Segundo plano: proceso desacoplado, salida a archivo. Sobrevive a esta terminal.
 	fs.mkdirSync(runs.runsDir(), { recursive: true });
-	const logPath = runs.logFile(p.name);
+	const logPath = runs.logFile(runName);
 	const fd = fs.openSync(logPath, "w");
-	const args = [SERVER, "--profile", p.name, "--origin", flags.origin || "cli", "--log", logPath];
-	if (flags.open === false) args.push("--no-open");
-
-	const child = spawn(process.execPath, args, {
-		cwd: path.dirname(SERVER),
+	const child = spawn(process.execPath, [script, ...scriptArgs, "--origin", flags.origin || "cli", "--log", logPath], {
+		cwd: path.dirname(script),
 		detached: true,
 		windowsHide: true,
 		stdio: ["ignore", fd, fd]
@@ -327,29 +338,48 @@ async function cmdStart() {
 	while (Date.now() < deadline) {
 		if (exitCode === EXIT.BUSY) {
 			// Otro `start` gano la carrera: se espera a ese.
-			const winner = await waitHealthy(p.name, deadline);
-			if (winner) return result(winner, true);
+			const winner = await waitHealthy(runName, deadline);
+			if (winner) return { record: winner, already: true };
 			break;
 		}
 		if (exitCode !== null) {
-			die(exitCode, `cf-proxy (${p.name}) termino al arrancar.`, { tail: tailLines(logPath), log: logPath });
+			die(exitCode, `${label} termino al arrancar.`, { tail: tailLines(logPath), log: logPath });
 		}
-		const record = runs.read(p.name);
-		if (record && record.pid === child.pid && record.state === "listening" && (await runs.health(record))) {
-			return result(record, false);
+		const record = runs.read(runName);
+		if (record && record.pid === child.pid && (await isReady(record))) {
+			return { record, already: false };
 		}
 		await sleep(500);
 	}
-	die(EXIT.ERROR, `cf-proxy (${p.name}) no respondio a tiempo. Sigue arrancando en segundo plano.`,
-		{ hint: `Ver: cf-proxy logs ${p.name}`, tail: tailLines(logPath), log: logPath });
+	die(EXIT.ERROR, `${label} no respondio a tiempo. Sigue arrancando en segundo plano.`,
+		{ hint: `Ver: ${logsHint}`, tail: tailLines(logPath), log: logPath });
 }
 
-async function cmdStop() {
-	const p = requireProfile(positional[1], false);
-	const record = runs.read(p.name);
+async function cmdStart() {
+	const p = requireProfile(positional[1], true);
+	const scriptArgs = ["--profile", p.name];
+	if (flags.open === false) scriptArgs.push("--no-open");
+
+	const { record, already } = await launchBackground({
+		runName: p.name,
+		script: SERVER,
+		scriptArgs,
+		label: `cf-proxy (${p.name})`,
+		stopHint: `cf-proxy stop ${p.name}`,
+		logsHint: `cf-proxy logs ${p.name}`
+	});
+	done(
+		{ already, profile: p.name, url: record.url, port: record.port, pid: record.pid, log: record.log },
+		() => console.log(`${already ? "Ya estaba corriendo" : "OK"}  ${p.title}: ${record.url}  (pid ${record.pid})`)
+	);
+}
+
+/** Corta una corrida (proxy o tunel) y limpia su registro. false si no corria. */
+async function stopRun(runName) {
+	const record = runs.read(runName);
 	if (!record || !runs.isAlive(record)) {
 		runs.list(); // limpia el registro muerto, si habia
-		return done({ profile: p.name, wasRunning: false }, () => console.log(`${p.name} no estaba corriendo.`));
+		return null;
 	}
 
 	runs.killTree(record);
@@ -357,9 +387,18 @@ async function cmdStop() {
 		await sleep(500);
 	}
 	// taskkill /F no deja correr el handler de salida: el registro se borra aca.
-	const after = runs.read(p.name);
+	const after = runs.read(runName);
 	if (after && after.pid === record.pid) {
-		try { fs.unlinkSync(runs.recordFile(p.name)); } catch (e) { /* ya no estaba */ }
+		try { fs.unlinkSync(runs.recordFile(runName)); } catch (e) { /* ya no estaba */ }
+	}
+	return record;
+}
+
+async function cmdStop() {
+	const p = requireProfile(positional[1], false);
+	const record = await stopRun(p.name);
+	if (!record) {
+		return done({ profile: p.name, wasRunning: false }, () => console.log(`${p.name} no estaba corriendo.`));
 	}
 	done({ profile: p.name, wasRunning: true, pid: record.pid }, () => console.log(`${p.name} detenido (pid ${record.pid}).`));
 }
@@ -395,7 +434,7 @@ function loginLabel(login) {
 }
 
 async function describeRuns(only) {
-	const list = runs.list().filter((r) => !only || r.profile === only);
+	const list = runs.list().filter((r) => r.kind !== "tunnel" && (!only || r.profile === only));
 	return Promise.all(list.map(async (r) => {
 		const s = await runs.status(r);
 		return {
@@ -418,24 +457,58 @@ async function describeRuns(only) {
 	}));
 }
 
+/** Tuneles corriendo, opcionalmente solo los de un perfil. */
+async function describeTunnelRuns(forProfile) {
+	const list = runs.list().filter((r) => r.kind === "tunnel" && (!forProfile || r.forProfile === forProfile));
+	return Promise.all(list.map(async (r) => ({
+		tunnel: r.tunnel,
+		profile: r.forProfile,
+		service: r.service,
+		host: "localhost",
+		port: r.port,
+		remote: r.remote || null,
+		app: r.app || null,
+		org: r.org,
+		space: r.space,
+		pid: r.pid,
+		startedAt: r.startedAt,
+		log: r.log,
+		status: (await runs.status(r)).status
+	})));
+}
+
+function printTable(rows) {
+	const widths = rows[0].map((_, i) => Math.max(...rows.map((row) => row[i].length)));
+	for (const row of rows) console.log(row.map((c, i) => c.padEnd(widths[i])).join("  "));
+}
+
 async function cmdPs() {
 	const only = positional[0] === "status" ? positional[1] : null;
 	if (only) requireProfile(only, false);
 	const list = await describeRuns(only);
-	done({ runs: list }, () => {
-		if (!list.length) return console.log(only ? `${only} no esta corriendo.` : "No hay proxies corriendo.");
-		const rows = [["PERFIL", "TITULO", "USUARIO", "ORG / SPACE", "PUERTO", "PID", "ESTADO", "LOGIN USUARIO"]].concat(
+	const tunnelList = await describeTunnelRuns(only);
+	done({ runs: list, tunnels: tunnelList }, () => {
+		if (!list.length) console.log(only ? `${only} no esta corriendo.` : "No hay proxies corriendo.");
+		else printTable([["PERFIL", "TITULO", "USUARIO", "ORG / SPACE", "PUERTO", "PID", "ESTADO", "LOGIN USUARIO"]].concat(
 			list.map((r) => [r.profile, r.title || "", r.user || "", `${r.org} / ${r.space}`, String(r.port), String(r.pid), r.status, loginLabel(r.login)])
-		);
-		const widths = rows[0].map((_, i) => Math.max(...rows.map((row) => row[i].length)));
-		for (const row of rows) console.log(row.map((c, i) => c.padEnd(widths[i])).join("  "));
+		));
+		if (tunnelList.length) {
+			console.log("");
+			printTable([["TUNEL", "PERFIL", "SERVICIO", "LOCAL", "REMOTO", "VIA APP", "PID", "ESTADO"]].concat(
+				tunnelList.map((t) => [t.tunnel, t.profile, t.service, `localhost:${t.port}`, t.remote || "?", t.app || "?", String(t.pid), t.status])
+			));
+		}
 	});
 }
 
 async function cmdLogs() {
 	const p = requireProfile(positional[1], false);
-	const file = runs.logFile(p.name);
-	if (!fs.existsSync(file)) die(EXIT.USAGE, `No hay log de ${p.name} todavia.`);
+	showLog(runs.logFile(p.name), p.name);
+}
+
+/** Imprime un log; con -f sigue lo que se agrega. */
+function showLog(file, label) {
+	if (!fs.existsSync(file)) die(EXIT.USAGE, `No hay log de ${label} todavia.`);
 
 	process.stdout.write(fs.readFileSync(file, "utf8"));
 	if (!flags.follow) process.exit(0);
@@ -452,6 +525,92 @@ async function cmdLogs() {
 		offset = cur.size;
 		process.stdout.write(buf.toString("utf8"));
 	});
+}
+
+// ============================================================================
+// tunnels: tuneles locales a servicios del space (p.ej. PostgreSQL)
+// ============================================================================
+/** Tunel existente o corte con USAGE. `strict`: ademas tiene que poder arrancar. */
+function requireTunnel(name, strict) {
+	if (!name) die(EXIT.USAGE, "Falta el nombre del tunel.", { hint: "Ver: cf-proxy tunnels list" });
+	const t = tunnels.get(name);
+	if (!t) die(EXIT.USAGE, `No existe el tunel ${name}.`, { hint: "Ver: cf-proxy tunnels list" });
+	if (strict && t.problems.length) {
+		die(EXIT.USAGE, `El tunel ${name} no puede arrancar: ${t.problems.join("; ")}.`, { problems: t.problems });
+	}
+	return t;
+}
+
+/** Flags de la linea de comandos -> campos del tunel. Solo los que vinieron. */
+function tunnelFields() {
+	const out = {};
+	for (const k of ["name", "profile", "service", "app"]) {
+		if (typeof flags[k] === "string") out[k] = flags[k];
+	}
+	if (flags.port !== undefined) out.port = flags.port === "auto" ? "auto" : Number(flags.port);
+	return out;
+}
+
+async function cmdTunnels() {
+	const sub = positional[1] || "list";
+	try {
+		if (sub === "list") {
+			const list = tunnels.load();
+			return done({ tunnels: list }, () => {
+				if (!list.length) return console.log("No hay tuneles. Crear uno: cf-proxy tunnels add --name N --profile P --service <instancia> [--port N|auto]");
+				for (const t of list) {
+					const mark = t.problems.length ? "  !! " + t.problems.join("; ") : "";
+					console.log(`${t.name.padEnd(16)} localhost:${String(t.port).padEnd(6)} ${t.profile} / ${t.service}${t.app ? ` (via ${t.app})` : ""}${mark}`);
+				}
+			});
+		}
+		if (sub === "add") {
+			const t = tunnels.add(tunnelFields());
+			return done({ tunnel: t }, () => console.log(`Tunel ${t.name} creado en localhost:${t.port}. Arrancar: cf-proxy tunnels start ${t.name}`));
+		}
+		if (sub === "edit") {
+			const t = tunnels.edit(requireTunnel(positional[2]).name, tunnelFields());
+			return done({ tunnel: t }, () => console.log(`Tunel ${t.name} actualizado (localhost:${t.port}).`));
+		}
+		if (sub === "remove") {
+			const t = requireTunnel(positional[2]);
+			const record = runs.read(tunnels.runName(t.name));
+			if (record && runs.isAlive(record)) {
+				die(EXIT.BUSY, `El tunel ${t.name} esta corriendo. Detenerlo primero: cf-proxy tunnels stop ${t.name}`);
+			}
+			tunnels.remove(t.name);
+			return done({ removed: t.name }, () => console.log(`Tunel ${t.name} borrado.`));
+		}
+	} catch (e) {
+		die(EXIT.USAGE, e.message);
+	}
+
+	if (sub === "start") {
+		const t = requireTunnel(positional[2], true);
+		const { record, already } = await launchBackground({
+			runName: tunnels.runName(t.name),
+			script: TUNNEL_SCRIPT,
+			scriptArgs: ["--tunnel", t.name],
+			label: `El tunel ${t.name}`,
+			stopHint: `cf-proxy tunnels stop ${t.name}`,
+			logsHint: `cf-proxy tunnels logs ${t.name}`
+		});
+		return done(
+			{ already, tunnel: t.name, profile: t.profile, service: t.service, host: "localhost", port: record.port, remote: record.remote, app: record.app, pid: record.pid, log: record.log },
+			() => console.log(`${already ? "Ya estaba corriendo" : "OK"}  ${t.name}: localhost:${record.port} -> ${t.service} (${record.remote} via ${record.app}, pid ${record.pid})`)
+		);
+	}
+	if (sub === "stop") {
+		const t = requireTunnel(positional[2], false);
+		const record = await stopRun(tunnels.runName(t.name));
+		if (!record) return done({ tunnel: t.name, wasRunning: false }, () => console.log(`${t.name} no estaba corriendo.`));
+		return done({ tunnel: t.name, wasRunning: true, pid: record.pid }, () => console.log(`${t.name} detenido (pid ${record.pid}).`));
+	}
+	if (sub === "logs") {
+		const t = requireTunnel(positional[2], false);
+		return showLog(runs.logFile(tunnels.runName(t.name)), t.name);
+	}
+	die(EXIT.USAGE, `Subcomando desconocido: tunnels ${sub}`);
 }
 
 // ============================================================================
@@ -522,6 +681,7 @@ const COMMANDS = {
 	ps: cmdPs,
 	status: cmdPs,
 	logs: cmdLogs,
+	tunnels: cmdTunnels,
 	cf: cmdCf
 };
 

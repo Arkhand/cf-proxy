@@ -57,7 +57,35 @@ switch (args[0]) {
 		}
 		out(`API endpoint:   ${s.api}\nuser:           ${s.user}\norg:            ${s.org || ""}\nspace:          ${s.space || ""}`);
 		break;
+	case "space":
+		// `cf space <nombre> --guid`
+		out("11111111-2222-3333-4444-555555555555");
+		break;
+	case "ssh": {
+		// `cf ssh -k -N -L 127.0.0.1:<local>:<host>:<remoto> <app>`: un port-forward
+		// de verdad (TCP), para que el test pruebe que el tunel lleva los bytes.
+		const net = require("net");
+		const [, localPort, host, remotePort] = flag("-L").split(":");
+		if (args[args.length - 1] === "app-sin-ssh") out("Error opening SSH connection: ssh is disabled\nFAILED", 1);
+		net.createServer((client) => {
+			const upstream = net.connect(Number(remotePort), host);
+			client.pipe(upstream).pipe(client);
+			upstream.on("error", () => client.destroy());
+			client.on("error", () => upstream.destroy());
+		}).listen(Number(localPort), "127.0.0.1");
+		break;
+	}
 	case "curl":
+		// Tuneles: instancia `pg` con un binding cuyo host/puerto vienen de FAKE_PG_PORT.
+		if (args[1].startsWith("/v3/service_instances")) {
+			out(JSON.stringify({ resources: args[1].includes("names=pg") ? [{ guid: "inst-pg" }] : [], pagination: { next: null } }));
+		}
+		if (args[1].startsWith("/v3/service_credential_bindings?")) {
+			out(JSON.stringify({ resources: [{ guid: "bind-1", type: "app" }], pagination: { next: null } }));
+		}
+		if (args[1] === "/v3/service_credential_bindings/bind-1/details") {
+			out(JSON.stringify({ credentials: { hostname: "127.0.0.1", port: process.env.FAKE_PG_PORT, password: "secreto" } }));
+		}
 		if (args[1].startsWith("/v3/organizations")) {
 			out(JSON.stringify({ resources: [{ guid: "g1", name: s.org || "ORG" }], pagination: { next: null } }));
 		}

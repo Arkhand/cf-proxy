@@ -17,6 +17,8 @@ Lo que hace, en orden:
      el wrapper del perfil (nunca con la sesion global de `cf`).
   4. Cada corrida en su pestana: health, log en vivo, abrir pagina, detener,
      cerrar.
+  5. Tuneles a servicios del space (p.ej. PostgreSQL): alta, edicion, borrado,
+     iniciar y detener. Su estado sale del mismo `ps`.
 
 NO reemplaza nada del proxy: todo pasa por `node bin/cf-proxy.js` (cli.py),
 el mismo programa que se usa desde la terminal.
@@ -27,9 +29,10 @@ import tkinter as tk
 import webbrowser
 from tkinter import messagebox, ttk
 
-from . import cf, store
+from . import cf, store, theme
 from .cli import Cli, NO_RESOURCES, NO_SESSION, sso_passcode_url
-from .paths import find_proxy_dir, find_mtar
+from .paths import find_icon, find_proxy_dir, find_mtar
+from .theme import px
 
 PAD = {"padx": 8, "pady": 4}
 POLL_MS = 3000
@@ -41,8 +44,16 @@ class LauncherApp(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title("cf-proxy")
-        self.geometry("980x720")
-        self.minsize(820, 580)
+        self.fonts = theme.apply(self)
+        self.geometry(f"{px(1040)}x{px(820)}")
+        self.minsize(px(860), px(600))
+        # Un punto por estado, para filas y pestanas.
+        self.dots = {k: theme.dot(self, c) for k, c in
+                     (("ok", theme.OK), ("warn", theme.WARN), ("err", theme.ERR), ("idle", theme.IDLE))}
+        # El mismo icono del .exe; `default` lo hereda cada dialogo.
+        icon = find_icon()
+        if icon:
+            self.iconbitmap(default=str(icon))
 
         # Cola de mensajes: los hilos de trabajo no tocan widgets directamente,
         # escriben aca y el hilo de la UI los consume (tkinter no es thread-safe).
@@ -55,6 +66,9 @@ class LauncherApp(tk.Tk):
         self.running = {}       # perfil -> registro de `ps`
         self.tabs = {}          # perfil -> RunTab
         self.launched = set()   # perfiles iniciados desde ESTA ventana (para el cierre)
+        self.tunnels = []               # lo que devuelve `tunnels list`
+        self.tunnel_runs = {}           # tunel -> registro de `ps`
+        self.launched_tunnels = set()   # tuneles iniciados desde ESTA ventana
         self.polling = False
 
         self._build()
@@ -70,51 +84,111 @@ class LauncherApp(tk.Tk):
     # Construccion de la ventana
     # -----------------------------------------------------------------
     def _build(self):
-        root = ttk.Frame(self, padding=10)
+        root = ttk.Frame(self, padding=(px(16), px(12), px(16), px(8)))
         root.pack(fill="both", expand=True)
         root.columnconfigure(0, weight=1)
         root.rowconfigure(1, weight=1)
 
-        self._build_profiles(root).grid(row=0, column=0, sticky="ew", pady=(0, 8))
+        head = ttk.Frame(root)
+        head.grid(row=0, column=0, sticky="ew", pady=(0, px(10)))
+        ttk.Label(head, text="cf-proxy", style="Title.TLabel").pack(side="left")
+        ttk.Label(head, text="Proxy local a las destinations de SAP BTP", style="Muted.TLabel").pack(
+            side="left", padx=(px(10), 0), pady=(px(5), 0))
 
-        self.notebook = ttk.Notebook(root)
-        self.notebook.grid(row=1, column=0, sticky="nsew")
-        general = ttk.Frame(self.notebook, padding=4)
+        # Tablas arriba y pestanas abajo, con un divisor que se puede arrastrar:
+        # el log necesita espacio cuando algo falla, las tablas cuando hay muchos perfiles.
+        panes = ttk.Panedwindow(root, orient="vertical")
+        panes.grid(row=1, column=0, sticky="nsew")
+        top = ttk.Frame(panes)
+        top.columnconfigure(0, weight=1)
+        self._build_profiles(top).grid(row=0, column=0, sticky="ew", pady=(0, px(14)))
+        self._build_tunnels(top).grid(row=1, column=0, sticky="ew", pady=(0, px(6)))
+        panes.add(top, weight=0)
+
+        self.notebook = ttk.Notebook(panes)
+        general = ttk.Frame(self.notebook, padding=0)
         general.columnconfigure(0, weight=1)
         general.rowconfigure(0, weight=1)
         self.log = make_log(general)
-        self.notebook.add(general, text="  Launcher  ")
+        self.notebook.add(general, text="Actividad")
+        panes.add(self.notebook, weight=1)
 
-        self.status_var = tk.StringVar(value="Verificando requisitos…")
-        ttk.Label(root, textvariable=self.status_var, foreground="#555").grid(
-            row=2, column=0, sticky="w", pady=(6, 0))
+        ttk.Separator(root).grid(row=2, column=0, sticky="ew", pady=(px(8), px(6)))
+        bar = ttk.Frame(root)
+        bar.grid(row=3, column=0, sticky="ew")
+        self.busy = ttk.Progressbar(bar, mode="indeterminate", length=px(90), style="Busy.Horizontal.TProgressbar")
+        self.status_var = tk.StringVar()
+        ttk.Label(bar, textvariable=self.status_var, style="Muted.TLabel").pack(side="left")
+        # Todo mensaje de estado que termina en "…" es trabajo en curso: se
+        # muestra la barra animada sin tener que avisarla en cada llamada.
+        self.status_var.trace_add("write", lambda *_: self._show_busy(self.status_var.get().endswith("…")))
+        self.status_var.set("Verificando requisitos…")
+
+    def _show_busy(self, on):
+        if on:
+            self.busy.pack(side="right")
+            self.busy.start(12)
+        else:
+            self.busy.stop()
+            self.busy.pack_forget()
 
     def _build_profiles(self, parent):
-        box = ttk.LabelFrame(parent, text="Perfiles (uno por subcuenta)", padding=8)
+        box = ttk.Frame(parent)
         box.columnconfigure(0, weight=1)
 
-        cols = ("title", "target", "port", "state")
-        self.tree = ttk.Treeview(box, columns=cols, height=6, selectmode="browse")
-        self.tree.heading("#0", text="Perfil")
-        self.tree.heading("title", text="Título")
-        self.tree.heading("target", text="Org / Space")
-        self.tree.heading("port", text="Puerto")
-        self.tree.heading("state", text="Estado")
-        self.tree.column("#0", width=130)
-        self.tree.column("title", width=160)
-        self.tree.column("target", width=220)
-        self.tree.column("port", width=60, anchor="center")
-        self.tree.column("state", width=320)
-        self.tree.tag_configure("problem", foreground="#c0392b")
-        self.tree.tag_configure("running", foreground="#1e7e34")
-        self.tree.grid(row=0, column=0, sticky="ew")
-        self.tree.bind("<Double-1>", lambda e: self._edit())
+        head = ttk.Frame(box)
+        head.grid(row=0, column=0, sticky="ew", pady=(0, px(6)))
+        ttk.Label(head, text="Perfiles", style="Section.TLabel").pack(side="left")
+        ttk.Label(head, text="uno por subcuenta", style="Hint.TLabel").pack(side="left", padx=(px(8), 0), pady=(px(3), 0))
+        self.profile_buttons = toolbar(head, (
+            ("toggle", "▶  Iniciar", self._toggle_selected, "Accent.TButton"),
+            ("login", "Login", self._login_selected, None),
+            ("|",),
+            ("new", "+  Nuevo", self._new, None),
+            ("edit", "Editar", self._edit, None),
+            ("delete", "Borrar", self._delete, None),
+        ))
 
-        buttons = ttk.Frame(box)
-        buttons.grid(row=0, column=1, sticky="n", padx=(8, 0))
-        for text, cmd in (("Iniciar", self._start_selected), ("Login", self._login_selected),
-                          ("Nuevo", self._new), ("Editar", self._edit), ("Borrar", self._delete)):
-            ttk.Button(buttons, text=text, command=cmd, width=10).pack(fill="x", pady=2)
+        cols = ("title", "target", "port", "state")
+        self.tree = make_tree(box, cols, height=6, widths={
+            "#0": ("Perfil", 150), "title": ("Título", 170), "target": ("Org / Space", 250),
+            "port": ("Puerto", 70), "state": ("Estado", 320)})
+        self.tree.bind("<Double-1>", lambda e: self._edit())
+        self.tree.bind("<Return>", lambda e: self._toggle_selected())
+        self.tree.bind("<Delete>", lambda e: self._delete())
+        self.tree.bind("<<TreeviewSelect>>", lambda e: self._sync_profile_buttons())
+        self.tree.bind("<Button-3>", self._profile_menu)
+        self.profiles_empty = empty_hint(self.tree, "Todavía no hay perfiles. Tocá «+ Nuevo» para crear el primero.")
+        return box
+
+    def _build_tunnels(self, parent):
+        box = ttk.Frame(parent)
+        box.columnconfigure(0, weight=1)
+
+        head = ttk.Frame(box)
+        head.grid(row=0, column=0, sticky="ew", pady=(0, px(6)))
+        ttk.Label(head, text="Túneles", style="Section.TLabel").pack(side="left")
+        ttk.Label(head, text="a servicios del space, p.ej. PostgreSQL", style="Hint.TLabel").pack(
+            side="left", padx=(px(8), 0), pady=(px(3), 0))
+        self.tunnel_buttons = toolbar(head, (
+            ("toggle", "▶  Iniciar", self._toggle_tunnel, "Accent.TButton"),
+            ("|",),
+            ("new", "+  Nuevo", self._new_tunnel, None),
+            ("edit", "Editar", self._edit_tunnel, None),
+            ("delete", "Borrar", self._delete_tunnel, None),
+        ))
+
+        cols = ("profile", "service", "local", "remote", "state")
+        self.tunnel_tree = make_tree(box, cols, height=3, widths={
+            "#0": ("Túnel", 150), "profile": ("Perfil", 110), "service": ("Instancia", 190),
+            "local": ("Local", 120), "remote": ("Remoto (vía app)", 240), "state": ("Estado", 150)})
+        self.tunnel_tree.bind("<Double-1>", lambda e: self._edit_tunnel())
+        self.tunnel_tree.bind("<Return>", lambda e: self._toggle_tunnel())
+        self.tunnel_tree.bind("<Delete>", lambda e: self._delete_tunnel())
+        self.tunnel_tree.bind("<<TreeviewSelect>>", lambda e: self._sync_tunnel_buttons())
+        self.tunnel_tree.bind("<Button-3>", self._tunnel_menu)
+        self.tunnels_empty = empty_hint(
+            self.tunnel_tree, "Sin túneles. Sirven para llegar desde tu PC a una base de BTP (p.ej. para un CAP en modo hybrid).")
         return box
 
     # -----------------------------------------------------------------
@@ -168,6 +242,7 @@ class LauncherApp(tk.Tk):
                 return
             self._say(f"cf-proxy: {self.proxy_dir}", "info")
             self._refresh_profiles()
+            self._refresh_tunnels()
             self._ui(self._poll)
 
         self._background(work)
@@ -193,21 +268,23 @@ class LauncherApp(tk.Tk):
         self.profiles = profiles
         selected = self.tree.selection()
         self.tree.delete(*self.tree.get_children())
-        for p in profiles:
-            self.tree.insert("", "end", iid=p["name"], text=p["name"], values=self._profile_row(p),
-                             tags=self._profile_tags(p))
+        for i, p in enumerate(profiles):
+            self.tree.insert("", "end", iid=p["name"], text=" " + p["name"], values=self._profile_row(p),
+                             image=self.dots[self._profile_state(p)], tags=self._profile_tags(p, i))
         if selected and self.tree.exists(selected[0]):
             self.tree.selection_set(selected[0])
         elif profiles:
             self.tree.selection_set(profiles[0]["name"])
+        show_empty(self.profiles_empty, not profiles)
+        self._sync_profile_buttons()
 
     def _profile_row(self, p):
         target = f"{p['org']} / {p['space']}" if p["org"] else "(sin org: falta login)"
         run = self.running.get(p["name"])
         if run:
-            state = f"corriendo ({run['status']})  {run['url']}"
-            login = run.get("login")
-            if login and login["configured"] and not login["loggedIn"]:
+            state = "corriendo" if run["status"] == "ok" else f"corriendo ({run['status']})"
+            state += f"  ·  {run['url']}"
+            if self._missing_user_login(run):
                 state += "  ·  falta login de usuario"
         elif p["problems"]:
             state = "; ".join(p["problems"])
@@ -215,19 +292,77 @@ class LauncherApp(tk.Tk):
             state = "listo"
         return (p["title"], target, p["port"], state)
 
-    def _profile_tags(self, p):
-        if p["name"] in self.running:
-            return ("running",)
-        return ("problem",) if p["problems"] else ()
+    @staticmethod
+    def _missing_user_login(run):
+        login = run.get("login")
+        return bool(login and login["configured"] and not login["loggedIn"])
+
+    def _profile_state(self, p):
+        """Color del punto: verde corriendo bien, ambar corriendo con algo pendiente, rojo con problemas."""
+        run = self.running.get(p["name"])
+        if run:
+            return "ok" if run["status"] == "ok" and not self._missing_user_login(run) else "warn"
+        return "err" if p["problems"] else "idle"
+
+    def _profile_tags(self, p, i):
+        tags = ["odd"] if i % 2 else []
+        if p["problems"] and p["name"] not in self.running:
+            tags.append("problem")
+        return tags
 
     def _update_profile_rows(self):
-        for p in self.profiles:
+        for i, p in enumerate(self.profiles):
             if self.tree.exists(p["name"]):
-                self.tree.item(p["name"], values=self._profile_row(p), tags=self._profile_tags(p))
+                self.tree.item(p["name"], values=self._profile_row(p), image=self.dots[self._profile_state(p)],
+                               tags=self._profile_tags(p, i))
+        self._sync_profile_buttons()
 
     def _selected(self):
         sel = self.tree.selection()
         return next((p for p in self.profiles if sel and p["name"] == sel[0]), None)
+
+    def _sync_profile_buttons(self):
+        """El boton principal es Iniciar o Detener segun la fila; sin fila, solo Nuevo."""
+        p = self._selected()
+        b = self.profile_buttons
+        running = bool(p and p["name"] in self.running)
+        b["toggle"].configure(text="■  Detener" if running else "▶  Iniciar")
+        for key in ("toggle", "login", "edit", "delete"):
+            b[key].configure(state="normal" if p else "disabled")
+
+    def _toggle_selected(self):
+        p = self._selected()
+        if not p:
+            return
+        if p["name"] in self.running:
+            self.stop(p["name"])
+        else:
+            self.start(p)
+
+    def _profile_menu(self, event):
+        """Clic derecho: las mismas acciones, mas abrir y copiar la URL si corre."""
+        row = self.tree.identify_row(event.y)
+        if not row:
+            return
+        self.tree.selection_set(row)
+        self.tree.focus(row)
+        p = self._selected()
+        run = self.running.get(p["name"])
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Detener" if run else "Iniciar", command=self._toggle_selected)
+        if run:
+            menu.add_command(label="Abrir página", command=lambda: webbrowser.open(run["url"]))
+            menu.add_command(label="Copiar URL", command=lambda: self.copy(run["url"]))
+        menu.add_command(label="Login", command=self._login_selected)
+        menu.add_separator()
+        menu.add_command(label="Editar…", command=self._edit)
+        menu.add_command(label="Borrar…", command=self._delete)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def copy(self, text):
+        self.clipboard_clear()
+        self.clipboard_append(text)
+        self.status_var.set(f"Copiado: {text}")
 
     def _new(self):
         ProfileEditor(self, None)
@@ -326,11 +461,6 @@ class LauncherApp(tk.Tk):
     # -----------------------------------------------------------------
     # PASO 3 - Iniciar
     # -----------------------------------------------------------------
-    def _start_selected(self):
-        p = self._selected()
-        if p:
-            self.start(p)
-
     def start(self, p):
         if p["problems"]:
             messagebox.showwarning("Perfil incompleto",
@@ -425,7 +555,7 @@ class LauncherApp(tk.Tk):
             if not tab:
                 tab = RunTab(self, run)
                 self.tabs[name] = tab
-                self.notebook.add(tab, text=f"  {run.get('title') or name}  ")
+                self.notebook.add(tab, text=f" {run.get('title') or name}", image=self.dots["idle"], compound="left")
             tab.update_run(run)
 
         # Las que ya no corren quedan como "detenido" hasta que se cierren.
@@ -434,6 +564,8 @@ class LauncherApp(tk.Tk):
                 tab.mark_stopped()
 
         self._update_profile_rows()
+        self.tunnel_runs = {t["tunnel"]: t for t in res.get("tunnels", [])}
+        self._update_tunnel_rows()
 
     def _tail_all(self):
         for tab in list(self.tabs.values()):
@@ -475,10 +607,12 @@ class LauncherApp(tk.Tk):
         terminal o desde otra sesion sigue corriendo: no es de esta ventana.
         """
         mine = sorted(n for n in self.launched if n in self.running)
-        if mine:
+        mine_tunnels = sorted(n for n in self.launched_tunnels if n in self.tunnel_runs)
+        if mine or mine_tunnels:
+            names = mine + [f"túnel {n}" for n in mine_tunnels]
             answer = messagebox.askyesnocancel(
                 "Hay proxies corriendo",
-                "Esta ventana inició: " + ", ".join(mine) + ".\n\n"
+                "Esta ventana inició: " + ", ".join(names) + ".\n\n"
                 "Sí: detenerlos y cerrar.\nNo: cerrar y dejarlos corriendo.\nCancelar: no cerrar.",
                 parent=self)
             if answer is None:
@@ -486,14 +620,192 @@ class LauncherApp(tk.Tk):
             if answer:
                 for name in mine:
                     self.cli.stop(name)
+                for name in mine_tunnels:
+                    self.cli.stop_tunnel(name)
         self.destroy()
+
+    # -----------------------------------------------------------------
+    # PASO 5 - Tuneles a servicios del space
+    # -----------------------------------------------------------------
+    def _refresh_tunnels(self):
+        """Relee los tuneles desde la consola. Llamable desde cualquier hilo."""
+        def work():
+            res = self.cli.tunnels()
+            if not res.get("ok"):
+                self._say(f"No se pudieron leer los túneles: {res.get('error')}", "err")
+                return
+            self._ui(lambda: self._fill_tunnels(res["tunnels"]))
+
+        self._background(work)
+
+    def _fill_tunnels(self, tunnels):
+        self.tunnels = tunnels
+        selected = self.tunnel_tree.selection()
+        self.tunnel_tree.delete(*self.tunnel_tree.get_children())
+        for i, t in enumerate(tunnels):
+            self.tunnel_tree.insert("", "end", iid=t["name"], text=" " + t["name"], values=self._tunnel_row(t),
+                                    image=self.dots[self._tunnel_state(t)], tags=self._tunnel_tags(t, i))
+        if selected and self.tunnel_tree.exists(selected[0]):
+            self.tunnel_tree.selection_set(selected[0])
+        elif tunnels:
+            self.tunnel_tree.selection_set(tunnels[0]["name"])
+        show_empty(self.tunnels_empty, not tunnels)
+        self._sync_tunnel_buttons()
+
+    def _tunnel_row(self, t):
+        run = self.tunnel_runs.get(t["name"])
+        if run:
+            remote = f"{run.get('remote') or '?'}  (vía {run.get('app') or '?'})"
+            state = "corriendo" if run["status"] == "ok" else f"corriendo ({run['status']})"
+        else:
+            remote = f"(vía {t['app']})" if t["app"] else ""
+            state = "; ".join(t["problems"]) if t["problems"] else "detenido"
+        return (t["profile"], t["service"], f"localhost:{t['port']}", remote, state)
+
+    def _tunnel_state(self, t):
+        run = self.tunnel_runs.get(t["name"])
+        if run:
+            return "ok" if run["status"] == "ok" else "warn"
+        return "err" if t["problems"] else "idle"
+
+    def _tunnel_tags(self, t, i):
+        tags = ["odd"] if i % 2 else []
+        if t["problems"] and t["name"] not in self.tunnel_runs:
+            tags.append("problem")
+        return tags
+
+    def _update_tunnel_rows(self):
+        for i, t in enumerate(self.tunnels):
+            if self.tunnel_tree.exists(t["name"]):
+                self.tunnel_tree.item(t["name"], values=self._tunnel_row(t), image=self.dots[self._tunnel_state(t)],
+                                      tags=self._tunnel_tags(t, i))
+        self._sync_tunnel_buttons()
+
+    def _selected_tunnel(self):
+        sel = self.tunnel_tree.selection()
+        return next((t for t in self.tunnels if sel and t["name"] == sel[0]), None)
+
+    def _sync_tunnel_buttons(self):
+        t = self._selected_tunnel()
+        b = self.tunnel_buttons
+        running = bool(t and t["name"] in self.tunnel_runs)
+        b["toggle"].configure(text="■  Detener" if running else "▶  Iniciar")
+        for key in ("toggle", "edit", "delete"):
+            b[key].configure(state="normal" if t else "disabled")
+
+    def _toggle_tunnel(self):
+        t = self._selected_tunnel()
+        if not t:
+            return
+        if t["name"] in self.tunnel_runs:
+            self._stop_tunnel()
+        else:
+            self._start_tunnel()
+
+    def _tunnel_menu(self, event):
+        row = self.tunnel_tree.identify_row(event.y)
+        if not row:
+            return
+        self.tunnel_tree.selection_set(row)
+        self.tunnel_tree.focus(row)
+        t = self._selected_tunnel()
+        menu = tk.Menu(self, tearoff=0)
+        menu.add_command(label="Detener" if t["name"] in self.tunnel_runs else "Iniciar", command=self._toggle_tunnel)
+        menu.add_command(label=f"Copiar localhost:{t['port']}", command=lambda: self.copy(f"localhost:{t['port']}"))
+        menu.add_separator()
+        menu.add_command(label="Editar…", command=self._edit_tunnel)
+        menu.add_command(label="Borrar…", command=self._delete_tunnel)
+        menu.tk_popup(event.x_root, event.y_root)
+
+    def _new_tunnel(self):
+        if not self.profiles:
+            messagebox.showinfo("Sin perfiles", "Un túnel es de un perfil: creá el perfil primero.", parent=self)
+            return
+        TunnelEditor(self, None)
+
+    def _edit_tunnel(self):
+        t = self._selected_tunnel()
+        if t:
+            TunnelEditor(self, t)
+
+    def _delete_tunnel(self):
+        t = self._selected_tunnel()
+        if not t:
+            return
+        if not messagebox.askyesno("Borrar túnel", f"Se borra el túnel `{t['name']}` (solo la config local). ¿Seguir?",
+                                   parent=self):
+            return
+
+        def work():
+            res = self.cli.remove_tunnel(t["name"])
+            if not res.get("ok"):
+                self._say(res.get("error"), "err")
+                return
+            self._say(f"Túnel `{t['name']}` borrado.", "info")
+            self._refresh_tunnels()
+
+        self._background(work)
+
+    def _start_tunnel(self):
+        t = self._selected_tunnel()
+        if not t:
+            return
+        if t["problems"]:
+            messagebox.showwarning("Túnel incompleto",
+                                   f"{t['name']} no puede arrancar:\n\n" + "\n".join(t["problems"]), parent=self)
+            return
+        self.status_var.set(f"Iniciando túnel {t['name']}…")
+        self._say(f"> cf-proxy tunnels start {t['name']}", "info")
+
+        def work():
+            res = self.cli.start_tunnel(t["name"])
+            if res.get("ok"):
+                self.launched_tunnels.add(t["name"])
+                verb = "ya estaba corriendo" if res.get("already") else "corriendo"
+                self._say(f"OK  túnel {t['name']} {verb}: localhost:{res['port']} -> {t['service']} "
+                          f"({res.get('remote')} vía {res.get('app')})", "ok")
+                self._ui(lambda: self.status_var.set(f"Túnel {t['name']}: localhost:{res['port']}"))
+                self._ui(self._poll_now)
+                return
+
+            if res.get("tail"):
+                for line in res["tail"].splitlines():
+                    self._say("  " + line)
+            if res.get("code") == NO_SESSION:
+                # La sesion es la del perfil del tunel: login de ese perfil y reintentar.
+                p = next((x for x in self.profiles if x["name"] == t["profile"]), None)
+                if p:
+                    self._say(f"{p['name']} no tiene sesión de cf: hace falta login.", "info")
+                    self._ui(lambda: self.login(p, then=self._start_tunnel))
+                    return
+            self._say(f"No arrancó el túnel {t['name']}: {res.get('error')}", "err")
+            self._ui(lambda: self.status_var.set(f"Túnel {t['name']}: no arrancó."))
+
+        self._background(work)
+
+    def _stop_tunnel(self):
+        t = self._selected_tunnel()
+        if not t:
+            return
+        self._say(f"> cf-proxy tunnels stop {t['name']}", "info")
+
+        def work():
+            res = self.cli.stop_tunnel(t["name"])
+            if not res.get("ok"):
+                self._say(f"No se pudo detener el túnel {t['name']}: {res.get('error')}", "err")
+            elif res.get("wasRunning"):
+                self._say(f"Túnel {t['name']} detenido.", "info")
+            self.launched_tunnels.discard(t["name"])
+            self._ui(self._poll_now)
+
+        self._background(work)
 
 
 class RunTab(ttk.Frame):
     """Una corrida: cabecera con su estado, botones, y el log en vivo."""
 
     def __init__(self, app, run):
-        super().__init__(app.notebook, padding=6)
+        super().__init__(app.notebook, padding=0)
         self.app = app
         self.name = run["profile"]
         self.run = run
@@ -503,28 +815,52 @@ class RunTab(ttk.Frame):
         self.columnconfigure(0, weight=1)
         self.rowconfigure(1, weight=1)
 
-        head = ttk.Frame(self)
-        head.grid(row=0, column=0, sticky="ew", pady=(0, 6))
+        head = tk.Frame(self, background=theme.SURFACE, padx=px(14), pady=px(10))
+        head.grid(row=0, column=0, sticky="ew")
         head.columnconfigure(0, weight=1)
+
+        # Linea 1: titulo y estado. Linea 2: la URL (clic = abrir) y copiarla.
+        line = tk.Frame(head, background=theme.SURFACE)
+        line.grid(row=0, column=0, sticky="w")
+        self.title_label = tk.Label(line, font=app.fonts["tab_title"], background=theme.SURFACE, foreground=theme.TEXT)
+        self.title_label.pack(side="left")
+        self.pill = tk.Label(line, font=app.fonts["small_bold"], foreground="#ffffff", padx=px(8), pady=px(1))
+        self.pill.pack(side="left", padx=(px(10), 0))
+
+        line = tk.Frame(head, background=theme.SURFACE)
+        line.grid(row=1, column=0, sticky="w", pady=(px(2), 0))
+        self.url_label = tk.Label(line, font=app.fonts["link"], background=theme.SURFACE, foreground=theme.ACCENT,
+                                  cursor="hand2")
+        self.url_label.pack(side="left")
+        self.url_label.bind("<Button-1>", lambda e: not self.stopped and webbrowser.open(self.run["url"]))
+        self.stopped = False
+        self.copy_label = tk.Label(line, text="copiar", font=app.fonts["small"], background=theme.SURFACE,
+                                   foreground=theme.MUTED, cursor="hand2")
+        self.copy_label.pack(side="left", padx=(px(8), 0))
+        self.copy_label.bind("<Button-1>", lambda e: app.copy(self.run["url"]))
+
         self.info_var = tk.StringVar()
-        self.state_var = tk.StringVar()
-        ttk.Label(head, textvariable=self.info_var).grid(row=0, column=0, sticky="w")
-        self.state_label = ttk.Label(head, textvariable=self.state_var)
-        self.state_label.grid(row=1, column=0, sticky="w")
+        tk.Label(head, textvariable=self.info_var, font=app.fonts["small"], background=theme.SURFACE,
+                 foreground=theme.MUTED).grid(row=2, column=0, sticky="w", pady=(px(4), 0))
         # Login de usuario (XSUAA): sin el, las destinations PrincipalPropagation
         # y OAuth2UserTokenExchange fallan. Se avisa aca antes de que pase.
         self.login_var = tk.StringVar()
-        self.login_label = ttk.Label(head, textvariable=self.login_var, wraplength=620)
-        self.login_label.grid(row=2, column=0, sticky="w")
+        self.login_label = tk.Label(head, textvariable=self.login_var, background=theme.SURFACE, justify="left",
+                                    anchor="w")
+        self.login_label.grid(row=3, column=0, columnspan=2, sticky="ew", pady=(px(4), 0))
+        # Ocupa todo el ancho y envuelve segun la ventana: el aviso es largo y no se tiene que cortar.
+        head.bind("<Configure>", lambda e: self.login_label.configure(wraplength=max(px(300), e.width - px(30))))
 
-        self.open_btn = ttk.Button(head, text="Abrir página", command=lambda: webbrowser.open(self.run["url"]))
-        self.open_btn.grid(row=0, column=1, rowspan=3, padx=(8, 0))
-        self.login_btn = ttk.Button(head, text="Login de usuario", command=self._user_login)
-        self.login_btn.grid(row=0, column=2, rowspan=3, padx=(8, 0))
-        self.stop_btn = ttk.Button(head, text="Detener", command=lambda: app.stop(self.name))
-        self.stop_btn.grid(row=0, column=3, rowspan=3, padx=(8, 0))
-        ttk.Button(head, text="Cerrar pestaña", command=lambda: app.close_tab(self.name)).grid(
-            row=0, column=4, rowspan=3, padx=(8, 0))
+        buttons = tk.Frame(head, background=theme.SURFACE)
+        buttons.grid(row=0, column=1, rowspan=3, sticky="ne")
+        self.open_btn = ttk.Button(buttons, text="Abrir página", style="Accent.TButton",
+                                   command=lambda: webbrowser.open(self.run["url"]))
+        self.open_btn.pack(side="left")
+        self.login_btn = ttk.Button(buttons, text="Login de usuario", command=self._user_login)
+        self.login_btn.pack(side="left", padx=(px(6), 0))
+        self.stop_btn = ttk.Button(buttons, text="Detener", command=lambda: app.stop(self.name))
+        self.stop_btn.pack(side="left", padx=(px(6), 0))
+        ttk.Button(buttons, text="✕  Cerrar", command=lambda: app.close_tab(self.name)).pack(side="left", padx=(px(6), 0))
 
         body = ttk.Frame(self)
         body.grid(row=1, column=0, sticky="nsew")
@@ -534,6 +870,11 @@ class RunTab(ttk.Frame):
         if not self.log_path:
             write_log(self.text, "Esta corrida se lanzó en primer plano: su salida está en esa terminal.", "info")
 
+    def _set_state(self, text, color, dot):
+        """Pastilla de estado en la cabecera y punto en la pestana."""
+        self.pill.configure(text=text, background=color)
+        self.app.notebook.tab(self, image=self.app.dots[dot])
+
     def update_run(self, run):
         # Un registro nuevo (otro pid) es otra corrida: el log se relee desde cero.
         if run["pid"] != self.run.get("pid") or run.get("log") != self.log_path:
@@ -541,14 +882,18 @@ class RunTab(ttk.Frame):
             self.offset = 0
             clear_log(self.text)
         self.run = run
+        self.stopped = False
         origin = {"ui": "ventana", "cli": "consola"}.get(run.get("origin"), run.get("origin") or "?")
-        self.info_var.set(f"{run.get('title') or self.name}  ·  {run.get('user') or '?'}  ·  "
-                          f"{run['org']} / {run['space']}  ·  puerto {run['port']}  ·  pid {run['pid']}  ·  lanzado desde {origin}")
-        extra = ""
+        parts = [run.get("user") or "?", f"{run['org']} / {run['space']}", f"puerto {run['port']}",
+                 f"pid {run['pid']}", f"lanzado desde {origin}"]
         if run.get("onPremise") is not None:
-            extra = "on-premise: " + ("sí" if run["onPremise"] else "no")
-        self.state_var.set(f"Estado: {run['status']}   {run['url']}   {extra}")
-        self.state_label.configure(foreground="#1e7e34" if run["status"] == "ok" else "#b8860b")
+            parts.append("on-premise: " + ("sí" if run["onPremise"] else "no"))
+        self.info_var.set("  ·  ".join(parts))
+        self.title_label.configure(text=run.get("title") or self.name)
+        self.url_label.configure(text=run["url"], foreground=theme.ACCENT, cursor="hand2")
+        ok = run["status"] == "ok"
+        self._set_state(run["status"], theme.OK if ok else theme.WARN,
+                        "ok" if ok and not LauncherApp._missing_user_login(run) else "warn")
         self.open_btn.configure(state="normal")
         self.stop_btn.configure(state="normal")
         self._show_login(run.get("login"))
@@ -557,25 +902,26 @@ class RunTab(ttk.Frame):
         """Linea y boton del login de usuario segun lo que reporta `ps`."""
         if login is None:
             self.login_var.set("Login de usuario: esperando que el proxy responda…")
-            self.login_label.configure(foreground="#555")
+            self.login_label.configure(foreground=theme.MUTED)
             self.login_btn.configure(state="disabled")
             return
         if not login["configured"]:
             self.login_var.set(f"Login de usuario: no disponible. {login.get('warning') or ''}")
-            self.login_label.configure(foreground="#555")
+            self.login_label.configure(foreground=theme.MUTED)
             self.login_btn.configure(state="disabled")
             return
         if login["loggedIn"]:
-            self.login_var.set(f"Login de usuario: {login.get('user') or 'OK'} (vence {login.get('expiresAt') or '?'}; se renueva solo)")
-            self.login_label.configure(foreground="#1e7e34")
+            self.login_var.set(f"✓  Login de usuario: {login.get('user') or 'OK'} "
+                               f"(vence {login.get('expiresAt') or '?'}; se renueva solo)")
+            self.login_label.configure(foreground=theme.OK)
             self.login_btn.configure(state="normal")
             return
-        text = ("Login de usuario: FALTA. Sin él fallan las destinations PrincipalPropagation "
+        text = ("⚠  Login de usuario: FALTA. Sin él fallan las destinations PrincipalPropagation "
                 "y OAuth2UserTokenExchange.")
         if login.get("warning"):
-            text += "  ⚠ " + login["warning"]
+            text += "\n" + login["warning"]
         self.login_var.set(text)
-        self.login_label.configure(foreground="#c0392b")
+        self.login_label.configure(foreground=theme.ERR)
         self.login_btn.configure(state="normal")
 
     def _user_login(self):
@@ -589,8 +935,9 @@ class RunTab(ttk.Frame):
         webbrowser.open(login.get("url") or f"http://localhost:{self.run['port']}/__login")
 
     def mark_stopped(self):
-        self.state_var.set("Estado: detenido")
-        self.state_label.configure(foreground="#c0392b")
+        self.stopped = True
+        self._set_state("detenido", theme.IDLE, "idle")
+        self.url_label.configure(foreground=theme.MUTED, cursor="")
         self.open_btn.configure(state="disabled")
         self.stop_btn.configure(state="disabled")
         self.login_btn.configure(state="disabled")
@@ -635,16 +982,24 @@ class ProfileEditor(tk.Toplevel):
         p = profile or {"name": "", "title": "", "api": DEFAULT_API, "user": "", "auth": "sso",
                         "org": "", "space": "", "port": "", "flags": {"open_browser": True}}
         self.title(f"Perfil {p['name']}" if self.editing else "Perfil nuevo")
-        self.transient(app)
-        self.resizable(False, False)
         self.targets = []
 
-        box = ttk.Frame(self, padding=10)
+        box = ttk.Frame(self, padding=(px(18), px(12), px(18), px(16)))
         box.pack(fill="both", expand=True)
         box.columnconfigure(1, weight=1)
 
         self.vars = {k: tk.StringVar(value=str(p.get(k) or "")) for k in ("name", "title", "api", "user", "org", "space", "port")}
         row = 0
+
+        def section(text, hint=""):
+            nonlocal row
+            head = ttk.Frame(box)
+            head.grid(row=row, column=0, columnspan=3, sticky="ew", pady=(px(14) if row else 0, px(2)))
+            ttk.Label(head, text=text, style="Section.TLabel").pack(side="left")
+            if hint:
+                ttk.Label(head, text=hint, style="Hint.TLabel").pack(side="left", padx=(px(8), 0), pady=(px(3), 0))
+            ttk.Separator(box).grid(row=row + 1, column=0, columnspan=3, sticky="ew", pady=(0, px(4)))
+            row += 2
 
         def field(label, key, **kw):
             nonlocal row
@@ -654,8 +1009,9 @@ class ProfileEditor(tk.Toplevel):
             row += 1
             return entry
 
-        field("Nombre", "name", state="disabled" if self.editing else "normal")
-        field("Título", "title")
+        section("Cuenta", "el usuario y la región de la subcuenta")
+        first = field("Nombre", "name", state="disabled" if self.editing else "normal")
+        title_entry = field("Título", "title")
         field("API endpoint", "api")
         field("Usuario", "user")
 
@@ -678,9 +1034,12 @@ class ProfileEditor(tk.Toplevel):
         self.remember_check.grid(row=row, column=2, sticky="w", **PAD)
         row += 1
 
+        self.pass_entry.bind("<Return>", lambda e: self._connect())
+
+        section("Destino", "org y space que ve ese usuario")
         ttk.Button(box, text="Conectar y listar orgs", command=self._connect).grid(row=row, column=1, sticky="w", **PAD)
         self.conn_var = tk.StringVar(value="")
-        ttk.Label(box, textvariable=self.conn_var, foreground="#555").grid(row=row, column=2, sticky="w", **PAD)
+        ttk.Label(box, textvariable=self.conn_var, style="Muted.TLabel").grid(row=row, column=2, sticky="w", **PAD)
         row += 1
 
         ttk.Label(box, text="Org").grid(row=row, column=0, sticky="w", **PAD)
@@ -698,25 +1057,34 @@ class ProfileEditor(tk.Toplevel):
 
         ttk.Label(box, text="Puerto").grid(row=row, column=0, sticky="w", **PAD)
         ttk.Entry(box, textvariable=self.vars["port"], width=8).grid(row=row, column=1, sticky="w", **PAD)
-        ttk.Label(box, text="vacío = el siguiente libre", foreground="#555").grid(row=row, column=2, sticky="w", **PAD)
+        ttk.Label(box, text="vacío = el siguiente libre", style="Hint.TLabel").grid(row=row, column=2, sticky="w", **PAD)
         row += 1
 
+        section("Opciones")
         flags = p.get("flags") or {}
         self.flag_vars = {k: tk.BooleanVar(value=bool(flags.get(k))) for k in ("tunnel", "login", "create_keys", "open_browser")}
         fbox = ttk.Frame(box)
         fbox.grid(row=row, column=0, columnspan=3, sticky="w", **PAD)
-        for key, text in (("tunnel", "Forzar túnel SSH"), ("login", "Abrir login de usuario"),
-                          ("create_keys", "Permitir crear service keys"), ("open_browser", "Abrir la página al arrancar")):
-            ttk.Checkbutton(fbox, text=text, variable=self.flag_vars[key]).pack(side="left", padx=(0, 12))
+        # En dos columnas, cada una con su "para que": en una sola fila no se entendia cuando marcarlas.
+        for i, (key, text, hint) in enumerate((
+                ("open_browser", "Abrir la página al arrancar", ""),
+                ("login", "Abrir login de usuario", "PrincipalPropagation / UserTokenExchange"),
+                ("tunnel", "Forzar túnel SSH", "on-premise sin cf-dest-app en el space"),
+                ("create_keys", "Permitir crear service keys", "si las instancias no tienen ninguna"))):
+            cell = ttk.Frame(fbox)
+            cell.grid(row=i // 2, column=i % 2, sticky="w", padx=(0, px(24)), pady=px(2))
+            ttk.Checkbutton(cell, text=text, variable=self.flag_vars[key]).pack(anchor="w")
+            if hint:
+                ttk.Label(cell, text=hint, style="Hint.TLabel").pack(anchor="w", padx=(px(22), 0))
         row += 1
 
         actions = ttk.Frame(box)
-        actions.grid(row=row, column=0, columnspan=3, sticky="e", pady=(10, 0))
-        ttk.Button(actions, text="Guardar", command=self._save).pack(side="left")
-        ttk.Button(actions, text="Cancelar", command=self.destroy).pack(side="left", padx=(8, 0))
+        actions.grid(row=row, column=0, columnspan=3, sticky="e", pady=(px(16), 0))
+        ttk.Button(actions, text="Cancelar", command=self.destroy).pack(side="left")
+        ttk.Button(actions, text="Guardar", style="Accent.TButton", command=self._save).pack(side="left", padx=(px(8), 0))
 
         self._toggle_auth()
-        self.grab_set()
+        prepare_dialog(self, app, focus=title_entry if self.editing else first)
 
     def _toggle_auth(self):
         """Con SSO no hay contrasena que escribir ni que recordar."""
@@ -811,14 +1179,148 @@ class ProfileEditor(tk.Toplevel):
         self.destroy()
 
 
+class TunnelEditor(tk.Toplevel):
+    """
+    Alta y edicion de un tunel. Solo guarda la config local: el host remoto
+    no se pide, se lee de los bindings de la instancia al arrancar.
+    """
+
+    def __init__(self, app, tunnel):
+        super().__init__(app)
+        self.app = app
+        self.editing = tunnel is not None
+        t = tunnel or {"name": "", "profile": app.profiles[0]["name"], "service": "", "port": "", "app": ""}
+        self.title(f"Túnel {t['name']}" if self.editing else "Túnel nuevo")
+
+        box = ttk.Frame(self, padding=(px(18), px(14), px(18), px(16)))
+        box.pack(fill="both", expand=True)
+        box.columnconfigure(1, weight=1)
+        self.vars = {k: tk.StringVar(value=str(t.get(k) or "")) for k in ("name", "profile", "service", "port", "app")}
+
+        rows = (
+            ("Nombre", "name", ""),
+            ("Perfil", "profile", "la subcuenta (org / space) donde está la instancia"),
+            ("Instancia", "service", "nombre de la instancia en el space, p.ej. la de postgresql-db"),
+            ("Puerto local", "port", "vacío = el siguiente libre desde 15432"),
+            ("App de salto", "app", "vacío = cf-dest-app, o una app con SSH"),
+        )
+        widgets = {}
+        for row, (label, key, hint) in enumerate(rows):
+            ttk.Label(box, text=label).grid(row=row, column=0, sticky="w", **PAD)
+            if key == "profile":
+                widget = ttk.Combobox(box, textvariable=self.vars[key], state="readonly",
+                                      values=[p["name"] for p in app.profiles], width=30)
+            else:
+                widget = ttk.Entry(box, textvariable=self.vars[key], width=32 if key != "port" else 8,
+                                   state="disabled" if key == "name" and self.editing else "normal")
+            widget.grid(row=row, column=1, sticky="w", **PAD)
+            widgets[key] = widget
+            ttk.Label(box, text=hint, style="Hint.TLabel").grid(row=row, column=2, sticky="w", **PAD)
+
+        actions = ttk.Frame(box)
+        actions.grid(row=len(rows), column=0, columnspan=3, sticky="e", pady=(px(14), 0))
+        ttk.Button(actions, text="Cancelar", command=self.destroy).pack(side="left")
+        ttk.Button(actions, text="Guardar", style="Accent.TButton", command=self._save).pack(side="left", padx=(px(8), 0))
+        self.bind("<Return>", lambda e: self._save())
+        prepare_dialog(self, app, focus=widgets["service" if self.editing else "name"])
+
+    def _save(self):
+        port = self.vars["port"].get().strip()
+        data = {
+            "name": self.vars["name"].get().strip(),
+            "profile": self.vars["profile"].get().strip(),
+            "service": self.vars["service"].get().strip(),
+            "port": int(port) if port.isdigit() else "auto",
+            "app": self.vars["app"].get().strip(),
+        }
+        if not data["name"] or not data["service"]:
+            messagebox.showwarning("Faltan datos", "Nombre e instancia.", parent=self)
+            return
+        res = self.app.cli.save_tunnel(data, self.editing)
+        if not res.get("ok"):
+            messagebox.showerror("No se pudo guardar", res.get("error"), parent=self)
+            return
+        t = res["tunnel"]
+        self.app._say(f"Túnel `{t['name']}` guardado (localhost:{t['port']}).", "ok")
+        self.app._refresh_tunnels()
+        self.destroy()
+
+
 # ---------------------------------------------------------------------------
 # Utilidades de widgets
 # ---------------------------------------------------------------------------
+def toolbar(parent, spec):
+    """
+    Botones a la derecha de la cabecera de una seccion. `spec`: tuplas
+    (clave, texto, comando, estilo) o ("|",) para un espacio entre grupos.
+    Devuelve {clave: boton}, para habilitarlos segun la seleccion.
+    """
+    bar = ttk.Frame(parent)
+    bar.pack(side="right")
+    buttons = {}
+    for item in spec:
+        if item[0] == "|":
+            ttk.Frame(bar, width=px(10)).pack(side="left")
+            continue
+        key, text, cmd, style = item
+        b = ttk.Button(bar, text=text, command=cmd, style=style or "TButton")
+        b.pack(side="left", padx=(px(4), 0))
+        buttons[key] = b
+    return buttons
+
+
+def make_tree(parent, cols, height, widths):
+    """Treeview con scroll, encabezados y filas en cebra. `widths`: col -> (titulo, ancho a 96 dpi)."""
+    frame = ttk.Frame(parent)
+    frame.grid(row=1, column=0, sticky="ew")
+    frame.columnconfigure(0, weight=1)
+    tree = ttk.Treeview(frame, columns=cols, height=height, selectmode="browse")
+    for col, (title, width) in widths.items():
+        tree.heading(col, text=title, anchor="w" if col != "port" else "center")
+        tree.column(col, width=px(width), minwidth=px(50), anchor="center" if col == "port" else "w",
+                    stretch=col == cols[-1])
+    tree.tag_configure("odd", background=theme.ZEBRA)
+    tree.tag_configure("problem", foreground=theme.ERR)
+    tree.grid(row=0, column=0, sticky="ew")
+    bar = ttk.Scrollbar(frame, orient="vertical", command=tree.yview)
+    bar.grid(row=0, column=1, sticky="ns")
+    tree.configure(yscrollcommand=bar.set)
+    return tree
+
+
+def empty_hint(tree, text):
+    """Texto centrado sobre una tabla vacia, para que no parezca que algo fallo."""
+    return tk.Label(tree, text=text, background=theme.SURFACE, foreground=theme.MUTED)
+
+
+def show_empty(label, empty):
+    if empty:
+        label.place(relx=0.5, rely=0.58, anchor="center")
+    else:
+        label.place_forget()
+
+
+def prepare_dialog(win, parent, focus=None):
+    """Modal, centrado sobre la ventana, Esc cancela."""
+    win.transient(parent)
+    win.resizable(False, False)
+    win.configure(background=theme.BG)
+    win.bind("<Escape>", lambda e: win.destroy())
+    win.update_idletasks()
+    x = parent.winfo_rootx() + (parent.winfo_width() - win.winfo_reqwidth()) // 2
+    y = parent.winfo_rooty() + max(0, (parent.winfo_height() - win.winfo_reqheight()) // 3)
+    win.geometry(f"+{max(0, x)}+{max(0, y)}")
+    if focus is not None:
+        focus.focus_set()
+    win.grab_set()
+
+
 def make_log(parent):
     """Text de solo lectura con scroll y colores por tipo de linea."""
     text = tk.Text(parent, wrap="none", height=14, state="disabled",
-                   background="#1e1e1e", foreground="#d4d4d4",
-                   insertbackground="#d4d4d4", font=("Consolas", 9))
+                   background="#1e1e1e", foreground="#d4d4d4", selectbackground="#264f78",
+                   insertbackground="#d4d4d4", font=parent.winfo_toplevel().fonts["mono"],
+                   borderwidth=0, highlightthickness=0, padx=px(10), pady=px(8))
     text.grid(row=0, column=0, sticky="nsew")
     bar = ttk.Scrollbar(parent, orient="vertical", command=text.yview)
     bar.grid(row=0, column=1, sticky="ns")
@@ -851,26 +1353,28 @@ def ask_secret(parent, title, prompt):
     """Dialogo modal para una contrasena o passcode. Devuelve '' si se cancela."""
     win = tk.Toplevel(parent)
     win.title(title)
-    win.transient(parent)
-    win.resizable(False, False)
+    box = ttk.Frame(win, padding=(px(18), px(14), px(18), px(14)))
+    box.pack(fill="both", expand=True)
     var = tk.StringVar()
-    ttk.Label(win, text=prompt, wraplength=380).grid(row=0, column=0, columnspan=2, sticky="w", padx=10, pady=(10, 6))
-    entry = ttk.Entry(win, textvariable=var, width=40, show="•")
-    entry.grid(row=1, column=0, columnspan=2, sticky="ew", padx=10, pady=4)
-    entry.focus_set()
+    ttk.Label(box, text=prompt, wraplength=px(380), justify="left").pack(anchor="w", pady=(0, px(8)))
+    entry = ttk.Entry(box, textvariable=var, width=44, show="•")
+    entry.pack(fill="x")
     result = {"value": ""}
 
     def accept():
         result["value"] = var.get().strip()
         win.destroy()
 
-    ttk.Button(win, text="Aceptar", command=accept).grid(row=2, column=0, sticky="e", padx=10, pady=10)
-    ttk.Button(win, text="Cancelar", command=win.destroy).grid(row=2, column=1, sticky="w", pady=10)
+    actions = ttk.Frame(box)
+    actions.pack(anchor="e", pady=(px(14), 0))
+    ttk.Button(actions, text="Cancelar", command=win.destroy).pack(side="left")
+    ttk.Button(actions, text="Aceptar", style="Accent.TButton", command=accept).pack(side="left", padx=(px(8), 0))
     entry.bind("<Return>", lambda e: accept())
-    win.grab_set()
+    prepare_dialog(win, parent, focus=entry)
     parent.wait_window(win)
     return result["value"]
 
 
 def main():
+    theme.enable_dpi_awareness()
     LauncherApp().mainloop()
